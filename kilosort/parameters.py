@@ -222,6 +222,41 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'drift_segment_starts': {
+        'gui_name': 'drift segment starts', 'type': str, 'min': None,
+        'max': None, 'exclude': [], 'default': None, 'step': 'preprocessing',
+        'description':
+            """
+            Path to a text file listing the start sample of each recording
+            segment (for example one per day of a concatenated chronic
+            recording), separated by whitespace, newlines, or commas. Sample
+            indices are relative to the start of the data and are independent
+            of `tmin`/`tmax`. If the first value is not 0, a 0 is prepended.
+
+            When set, drift is estimated once per segment instead of once per
+            batch: the vertical shift is held constant within each segment,
+            while remaining non-rigid across depth according to `nblocks`. This
+            is intended for chronic recordings in which day-to-day shifts
+            dominate and within-day drift is negligible. Leave as None for
+            standard per-batch drift correction.
+
+            When running through the API, a list of integers may be given
+            instead of a file path.
+            """
+    },
+
+    'drift_segment_diagnostics': {
+        'gui_name': 'drift segment diagnostics', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'preprocessing',
+        'description':
+            """
+            When `drift_segment_starts` is set, also estimate the residual
+            per-batch shift within each segment and report it. This checks the
+            assumption that drift is constant within a segment. Has no effect
+            otherwise.
+            """
+    },
+
 
     ### SPIKE DETECTION
     # NOTE: if left as None, will be set to `int(20 * settings['nt']/61)`

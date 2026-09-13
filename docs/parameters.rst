@@ -20,6 +20,11 @@ This sets the number of samples included in each batch of data to be sorted, wit
 This is the number of sections the probe is divided into when performing drift correction. The default of ``nblocks = 1`` indicates rigid registration (the same amount of drift is applied to the entire probe). If you see different amounts of drift in your data depending on depth along the probe, increasing ``nblocks`` will help get a better drift estimate. ``nblocks=5`` can be a good choice for single-shank Neuropixels probes. For probes with fewer channels (around 64 or less) or with sparser spacing (around 50um or more between contacts), drift estimates are not likely to be accurate, so drift correction should be skipped by setting ``nblocks = 0``.
 
 
+``drift_segment_starts`` and ``drift_segment_diagnostics``
+----------------------------------------------------------
+These are specific to this fork of Kilosort4. By default (``None``), drift is estimated separately for every batch. Setting ``drift_segment_starts`` to a text file listing the start sample of each recording segment instead holds the drift estimate constant within each segment, while keeping it non-rigid across depth according to ``nblocks``. This is meant for chronic recordings in which several daily sessions have been concatenated into one file: each day's spikes are pooled into a single fingerprint, which is far less noisy than a 2-second one, and day-to-day steps are no longer smoothed away. ``drift_segment_diagnostics`` (default ``True``) additionally measures the leftover per-batch drift within each segment, which is how you check that the constant-per-segment assumption holds. See the `Chronic drift correction <https://github.com/dimokaramanlis/ChronicKilosort#chronic-drift-correction-fork-addition>`_ section of the README for details.
+
+
 ``Th_universal`` and ``Th_learned``
 -----------------------------------
 These control the threshold for spike detection when applying the universal and learned templates, respectively (loosely similar to Th(1) and Th(2) in previous versions). If few spikes are detected, or if you see neurons disappearing and reappearing over time when viewing results in Phy, it may help to decrease ``Th_learned``. To detect more units overall, it may help to reduce ``Th_universal``. Try reducing each threshold by 1 or 2 at a time.

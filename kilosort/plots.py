@@ -20,6 +20,27 @@ PROBE_PLOT_COLORS = np.array([
     ])
 
 
+def segment_boundary_times(ops, tmin=0):
+    """Time (in seconds) of the first batch of each recording segment.
+
+    Returns None if chronic drift correction was not used. The times are
+    computed from batch indices rather than from sample indices, so that they
+    line up exactly with the time axis used by the drift plots.
+
+    """
+    seg = ops.get('batch_to_segment', None)
+    if seg is None:
+        return None
+
+    settings = ops['settings']
+    fs = settings['fs']
+    NT = settings['batch_size']
+    # first batch of each segment, excluding the first segment (t = tmin)
+    ibatch = np.flatnonzero(np.diff(seg)) + 1
+
+    return ibatch*(NT/fs) + tmin
+
+
 def plot_drift_amount(ops, results_dir, tmin=0):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(8,8))
@@ -33,12 +54,80 @@ def plot_drift_amount(ops, results_dir, tmin=0):
         color = COLOR_CODES[i % len(COLOR_CODES)]
         ax.plot(t, dshift[:,i], c=color)
 
+    boundaries = segment_boundary_times(ops, tmin=tmin)
+    if boundaries is not None:
+        for b in boundaries:
+            if t[0] <= b <= t[-1]:
+                ax.axvline(b, c='gray', ls='--', lw=0.75)
+
     ax.set_xlabel('Time (s)')
     ax.set_ylabel('Depth shift (um)')
     fig.suptitle('Drift amount per probe section, across batches')
     fig.tight_layout()
 
     save_path = results_dir / 'drift_amount.png'
+    fig.savefig(save_path, dpi=300)
+    plt.style.use('default')
+    plt.close(fig)
+
+
+def plot_chronic_drift(ops, results_dir, tmin=0):
+    """Plot per-segment drift and the within-segment residual drift.
+
+    Only meaningful when `drift_segment_starts` was set. The top panel shows
+    the (piecewise-constant) drift estimate, the bottom panel the residual
+    per-batch shift within each segment, which is the check on the assumption
+    that drift is constant within a segment.
+
+    """
+    if ops.get('batch_to_segment', None) is None:
+        return
+
+    dshift = ops['dshift']
+    settings = ops['settings']
+    fs = settings['fs']
+    NT = settings['batch_size']
+    dd = ops['binning_depth']
+    t = np.arange(dshift.shape[0])*(NT/fs) + tmin
+    boundaries = segment_boundary_times(ops, tmin=tmin)
+    residual = ops.get('drift_residual', None)
+
+    plt.style.use('dark_background')
+    nrows = 1 if residual is None else 2
+    fig, axes = plt.subplots(nrows, 1, figsize=(10, 4*nrows + 1), sharex=True,
+                             squeeze=False)
+    axes = axes[:,0]
+
+    ax = axes[0]
+    for i in range(dshift.shape[1]):
+        color = COLOR_CODES[i % len(COLOR_CODES)]
+        ax.step(t, dshift[:,i], where='post', c=color, lw=1)
+    ax.set_ylabel('Depth shift (um)')
+    ax.set_title(f'Drift per segment ({ops["drift_segment_used"].size} segments, '
+                 f'{dshift.shape[1]} blocks)')
+
+    if residual is not None:
+        ax = axes[1]
+        tr = ops['drift_residual_batches']*(NT/fs) + tmin
+        ax.axhspan(-dd, dd, color='gray', alpha=0.3, zorder=0)
+        for i in range(residual.shape[1]):
+            color = COLOR_CODES[i % len(COLOR_CODES)]
+            ax.plot(tr, residual[:,i], c=color, lw=0.5, alpha=0.8)
+        ax.set_ylabel('Residual shift (um)')
+        ax.set_title('Within-segment residual drift '
+                     f'(shaded band: +/- binning_depth = {dd} um)')
+
+    for ax in axes:
+        if boundaries is not None:
+            for b in boundaries:
+                if t[0] <= b <= t[-1]:
+                    ax.axvline(b, c='gray', ls='--', lw=0.75)
+    axes[-1].set_xlabel('Time (s)')
+
+    fig.suptitle('Chronic drift correction')
+    fig.tight_layout()
+
+    save_path = results_dir / 'drift_segments.png'
     fig.savefig(save_path, dpi=300)
     plt.style.use('default')
     plt.close(fig)

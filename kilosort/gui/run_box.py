@@ -3,7 +3,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 from kilosort.gui.sorter import KiloSortWorker
 from kilosort.gui.sanity_plots import (
     PlotWindow, plot_drift_amount, plot_drift_scatter, plot_diagnostics,
-    plot_spike_positions
+    plot_spike_positions, plot_chronic_drift
     )
 
 
@@ -224,6 +224,10 @@ class RunBox(QtWidgets.QGroupBox):
                     nrows=1, ncols=1, title='Drift Scatter', width=1500, height=700,
                     background='w'
                     ),
+                'chronic_drift': PlotWindow(
+                    nrows=2, ncols=1, width=900, height=700,
+                    title='Chronic Drift'
+                    ),
                 'diagnostics': PlotWindow(
                     nrows=2, ncols=2, width=800, height=800, title='Diagnostics'
                     ),
@@ -248,8 +252,12 @@ class RunBox(QtWidgets.QGroupBox):
             plot_window2 = self.plots['drift_scatter']
             dshift = self.current_worker.dshift
             st0 = self.current_worker.st0
-            plot_drift_amount(plot_window1, dshift, settings)
+            ops = getattr(self.current_worker, 'ops', None)
+            plot_drift_amount(plot_window1, dshift, settings, ops=ops)
             plot_drift_scatter(plot_window2, st0, settings)
+            # Only populated when chronic drift correction was used.
+            if ops is not None and ops.get('batch_to_segment', None) is not None:
+                plot_chronic_drift(self.plots['chronic_drift'], ops, settings)
 
         elif plot_type == 'diagnostics':
             plot_window = self.plots['diagnostics']

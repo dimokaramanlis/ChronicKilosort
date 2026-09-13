@@ -293,10 +293,14 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             if gui_sorter is not None:
                 gui_sorter.dshift = ops['dshift']
                 gui_sorter.st0 = st0
+                gui_sorter.ops = ops
                 gui_sorter.plotDataReady.emit('drift')
             else:
                 kplots.plot_drift_amount(ops, results_dir, tmin=settings['tmin'])
                 kplots.plot_drift_scatter(st0, results_dir, tmin=settings['tmin'])
+                if ops.get('batch_to_segment', None) is not None:
+                    kplots.plot_chronic_drift(ops, results_dir,
+                                              tmin=settings['tmin'])
 
         # Sort spikes and save results
         st,tF, Wall0, clu0 = detect_spikes(
@@ -549,6 +553,26 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
                          '(templates_from_data=False), nt must be 61')
 
     ops = {**ops, **probe}
+
+    # Parse the chronic drift segments here rather than in `datashift.run`, so
+    # that a bad path or a malformed file fails in the first second of the run
+    # instead of after preprocessing.
+    seg = settings.get('drift_segment_starts', None)
+    if seg is not None:
+        # The parsed array lives on `ops` only; `ops['settings']` keeps the
+        # original path/list so that saved settings stay serializable and
+        # comparable to the defaults.
+        ops['drift_segment_starts'] = io.load_drift_segments(seg)
+        if ops['nblocks'] < 1:
+            warnings.warn(
+                '`drift_segment_starts` was given but `nblocks=0`, so drift '
+                'correction is disabled and the segments will be ignored.',
+                UserWarning
+                )
+        logger.info(f'Chronic drift mode: {ops["drift_segment_starts"].size} '
+                    'segments requested.')
+    else:
+        ops['drift_segment_starts'] = None
 
     return ops, settings
 

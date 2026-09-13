@@ -1,5 +1,12 @@
 # Kilosort4
 
+> **This is ChronicKilosort, a fork of [Kilosort4](https://github.com/MouseLand/Kilosort).** It adds
+> an optional drift-correction mode for chronic recordings, in which several daily sessions have been
+> concatenated into one file: drift is estimated once per session instead of once per 2-second batch.
+> See [Chronic drift correction](#chronic-drift-correction-fork-addition) for how to use it, and
+> [Installing this fork](#installing-this-fork) for how to install it. Everything else behaves exactly
+> like upstream Kilosort4, and the feature is off by default.
+
 **If you use Kilosort 1-4, please cite the [paper](https://www.nature.com/articles/s41592-024-02232-7):**     
 Pachitariu, M., Sridhar, S., Pennington, J., & Stringer, C. (2024). Spike sorting with Kilosort4. _Nature Methods_ , 21, pages 914–921
 
@@ -27,6 +34,141 @@ Example notebooks are provided in the `docs/source/tutorials` folder and in the 
   3. `make_probe`:  making a custom probe configuration.
 
 **Warning**: There were two bugs in Kilosort 2, 2.5 and 3 (but not 4) which caused fewer spikes to be detected in ~7ms periods at batch boundaries (every 2.1866s, issue #594). The patch1 releases fix these bugs, please use the new default NT and ntbuff parameters. Also, we are no longer providing in-depth support for Kilosort 1-3. If you encounter difficulties using the older versions, we recommend trying Kilosort4 instead.
+
+
+## Installing this fork
+
+The fork is not on PyPI, so install it from the repository. These steps replace step 5 of the
+[general instructions](#instructions) below; the rest of that section (Anaconda, environment
+creation, the GPU version of PyTorch) applies unchanged.
+
+~~~
+conda create --name kilosort python=3.11
+conda activate kilosort
+pip install "kilosort[gui] @ git+https://github.com/dimokaramanlis/ChronicKilosort.git"
+~~~
+
+Use `pip install "kilosort @ git+https://github.com/dimokaramanlis/ChronicKilosort.git"` instead if
+you do not want the GUI. Then, to run on GPU (strongly recommended):
+
+~~~
+pip uninstall torch
+pip3 install torch --index-url https://download.pytorch.org/whl/cu118
+~~~
+
+Pick the CUDA version your card supports — see [Debugging PyTorch installation](#debugging-pytorch-installation)
+below.
+
+If you want to edit the code, clone it and install in editable mode instead:
+
+~~~
+git clone https://github.com/dimokaramanlis/ChronicKilosort.git
+conda env create -f ChronicKilosort/environment.yml
+conda activate kilosort
+pip install -e ChronicKilosort[gui]
+~~~
+
+Both forms install the package under the name `kilosort`, so `import kilosort`, `python -m kilosort`,
+and the `kilosort` command all work as usual. To check that you have the fork rather than upstream:
+
+~~~python
+from kilosort import DEFAULT_SETTINGS
+print('drift_segment_starts' in DEFAULT_SETTINGS)   # True for this fork
+~~~
+
+To go back to upstream Kilosort4, `pip uninstall kilosort` and then `pip install kilosort[gui]`.
+
+
+## Chronic drift correction (fork addition)
+
+Kilosort4 estimates vertical drift separately for every 2-second batch. For a chronic implant whose
+daily sessions have been concatenated into one file, that is both noisy (a 2-second fingerprint holds
+only a few thousand spikes) and expensive (the fingerprint tensor grows linearly with recording
+length). It also injects a slightly different resampling into every batch, which broadens clusters.
+
+This fork adds a mode in which drift is **constant within each recording segment** (one segment = one
+day) while remaining **non-rigid in depth** (`nblocks` works as before). Each segment's spikes are
+pooled into a single fingerprint, the segments are registered against each other, and the resulting
+shift is broadcast back to every batch of that segment. `ops['dshift']` keeps its usual
+`(Nbatches, 2*nblocks - 1)` shape, so the rest of the pipeline is unchanged.
+
+### Defining the segments
+
+Write a text file with the **start sample** of each segment, separated by whitespace, newlines, or
+commas. Sample indices are relative to the start of the data and are independent of `tmin`/`tmax`.
+For four daily sessions concatenated in order, this is the cumulative sample count:
+
+`segments.txt`
+~~~
+0
+108000000
+215700000
+324000000
+~~~
+
+If you know each day's duration in samples, the starts are `np.cumsum([0, *durations[:-1]])`. If the
+first value is not 0, a 0 is prepended and the data before it becomes its own segment.
+
+### Running it
+
+~~~python
+from kilosort import run_kilosort
+
+settings = {
+    'n_chan_bin': 385,
+    'nblocks': 5,                                    # non-rigid in depth, as before
+    'drift_segment_starts': 'D:/data/segments.txt',  # enables chronic mode
+    'drift_segment_diagnostics': True,               # default
+}
+run_kilosort(settings=settings, probe_name='neuropixPhase3B1_kilosortChanMap.mat')
+~~~
+
+A list of integers works too: `'drift_segment_starts': [0, 108000000, 215700000]`. Leaving it as
+`None` (the default) reproduces standard Kilosort4 behavior exactly.
+
+In the GUI, both settings are in the **Extra settings** window under the *preprocessing* heading.
+Type the path to `segments.txt` into `drift segment starts` (or `None` to disable it). The GUI writes
+`drift_amount.png` and, in chronic mode, a `Chronic Drift` window and `drift_segments.png`.
+
+### Reading the diagnostics
+
+With `drift_segment_diagnostics=True`, each batch is additionally registered against its *own*
+segment's fingerprint. If drift really is constant within a segment, that residual should be ~0. The
+log gets one row per segment:
+
+~~~
+Within-segment residual drift (worst block per segment):
+  seg  batches  median(um)       p5-p95(um)  max|res|(um)
+    0     1800       +0.20   -1.10.. +1.40          4.00
+    1     1800       -0.10   -0.90.. +1.00          3.50
+~~~
+
+and `drift_segments.png` in the results directory plots the per-segment drift (top) against the
+residual (bottom, with a shaded ±`binning_depth` band). Two warnings can be raised:
+
+* **Large spread** (p5–p95 above the tolerance) means drift is *not* constant within that day. Split
+  that day into shorter segments, or fall back to per-batch correction.
+* **Non-zero median** means the pooled registration is biased for that day — usually because the
+  fingerprint changed in *content* rather than position (units lost or gained, a gain change).
+
+The residuals are stored in `ops['drift_residual']`, `ops['drift_residual_batches']`, and
+`ops['drift_residual_summary']` (`[median, std, p5, p95]` per segment and block, in microns).
+
+### What this does and does not do
+
+* It is **not** unit tracking or matching across days. It aligns the days into a common depth frame
+  so that Kilosort4's global clustering can assign one cluster to a neuron seen on several days.
+  That is the necessary substrate, not a matching algorithm.
+* **Fingerprint content changes across days** (neurons lost or gained, electrode encapsulation) bias
+  any cross-correlation registration. The residual diagnostics are how you spot a bad day.
+* **Amplitude or gain drift across days** shifts mass along the fingerprint's amplitude axis.
+  Registration mean-subtracts along depth, which absorbs a constant offset, but a strong gain change
+  is still a confound. It is flagged, not silently corrected.
+* The **whitening matrix** is still estimated once over the whole concatenation. If per-day noise
+  levels differ a lot, that is a separate approximation this mode does not address.
+* All segments must share the **same probe geometry and channel map**.
+
+The design rationale and implementation notes are in [`CHRONIC_DRIFT_MODE.md`](CHRONIC_DRIFT_MODE.md).
 
 
 ## System requirements

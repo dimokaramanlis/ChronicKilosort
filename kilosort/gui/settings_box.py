@@ -24,7 +24,7 @@ _PROBE_SETTINGS = [
     ]
 _NONE_ALLOWED = [
     'dmin', 'nt0min', 'x_centers', 'shift', 'scale', 'max_channel_distance',
-    'max_cluster_subset'
+    'max_cluster_subset', 'drift_segment_starts'
     ]
 
 
@@ -971,7 +971,9 @@ def _check_parameter(sender_obj, main_obj, k, p):
             v = None
         else:
             v = _str_to_type(value, p['type'])
-            if isinstance(v, bool) or isinstance(v, list):
+            # `str` values (like file paths) have no min/max to compare
+            # against, and `None` bounds would raise an uncaught TypeError.
+            if isinstance(v, (bool, list, str)):
                 pass
             else:
                 assert v >= p['min']

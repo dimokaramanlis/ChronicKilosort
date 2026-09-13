@@ -135,6 +135,59 @@ def load_probe(probe_path):
     return probe
 
 
+def load_drift_segments(source):
+    """Load segment start samples for chronic drift correction.
+
+    Parameters
+    ----------
+    source : str, Path, or sequence of int
+        Path to a text file containing segment start samples separated by
+        whitespace, newlines, or commas; or the values directly.
+
+    Returns
+    -------
+    starts : np.ndarray
+        Segment start samples as int64, strictly increasing, starting at 0.
+
+    Notes
+    -----
+    Sample indices are relative to the start of the data, and so are
+    independent of `tmin` and `tmax`.
+
+    """
+
+    if isinstance(source, (str, Path)):
+        text = Path(source).read_text()
+        tokens = text.replace(',', ' ').split()
+        if len(tokens) == 0:
+            raise ValueError(f'No segment starts found in {source}')
+        try:
+            values = np.array([float(tok) for tok in tokens])
+        except ValueError as e:
+            raise ValueError(f'Could not parse segment starts from {source}') from e
+    else:
+        values = np.asarray(source, dtype='float64').ravel()
+        if values.size == 0:
+            raise ValueError('No segment starts found in `drift_segment_starts`')
+
+    if np.any(values != np.round(values)):
+        raise ValueError('Segment starts must be integer sample indices.')
+    starts = values.astype('int64')
+
+    if np.any(starts < 0):
+        raise ValueError('Segment starts must be non-negative.')
+    if np.any(np.diff(starts) <= 0):
+        raise ValueError('Segment starts must be strictly increasing.')
+    if starts[0] != 0:
+        logger.warning(
+            'First segment start was %d, not 0. Prepending 0 so that the data '
+            'before it forms its own segment.', starts[0]
+            )
+        starts = np.concatenate([[0], starts])
+
+    return starts
+
+
 def save_probe(probe_dict, filepath):
     """Save a probe dictionary to a .json text file.
 
@@ -986,6 +1039,8 @@ class BinaryFiltered(BinaryRWFile):
         self.do_CAR = do_CAR
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
+        # Only used for chronic drift correction, see `_drift_whiten`.
+        self._drift_cache = {}
 
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
         # pick only the channels specified in the chanMap
@@ -1018,12 +1073,31 @@ class BinaryFiltered(BinaryRWFile):
         # whitening, with optional drift correction
         if self.whiten_mat is not None:
             if self.dshift is not None and ops is not None and ibatch is not None:
-                M = get_drift_matrix(ops, self.dshift[ibatch], device=self.device)
-                #logger.info(M.dtype, X.dtype, self.whiten_mat.dtype)
-                X = (M @ self.whiten_mat) @ X
+                X = self._drift_whiten(ops, ibatch) @ X
             else:
                 X = self.whiten_mat @ X
         return X
+
+    def _drift_whiten(self, ops, ibatch):
+        """`M @ whiten_mat` for this batch, cached when drift is segment-wise.
+
+        In chronic drift mode every batch of a segment has the same `dshift`
+        row, so this product is otherwise recomputed identically thousands of
+        times. The cache is bounded by the number of segments.
+
+        """
+        row = self.dshift[ibatch]
+        seg = ops.get('batch_to_segment', None)
+        if seg is None:
+            # Per-batch drift: every row differs, caching would only waste memory.
+            return get_drift_matrix(ops, row, device=self.device) @ self.whiten_mat
+
+        key = int(seg[ibatch])
+        MW = self._drift_cache.get(key)
+        if MW is None:
+            MW = get_drift_matrix(ops, row, device=self.device) @ self.whiten_mat
+            self._drift_cache[key] = MW
+        return MW
 
     def __getitem__(self, *items):
         samples = super().__getitem__(*items)
