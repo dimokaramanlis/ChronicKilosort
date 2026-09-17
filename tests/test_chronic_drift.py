@@ -89,11 +89,13 @@ def _fake_spikes(ops, spikes_per_batch=200, depth_offset=None):
 
 class StubFile:
     """Stand-in for `io.BinaryFiltered` with just what `segment_batches` uses."""
-    def __init__(self, NT=100, imin=0, n_batches=10, batch_downsampling=1):
+    def __init__(self, NT=100, imin=0, n_batches=10, batch_downsampling=1,
+                 fs=100):
         self.NT = NT
         self.imin = imin
         self.n_batches = n_batches
         self.batch_downsampling = batch_downsampling
+        self.fs = fs
 
 
 class TestBinSpikes:
@@ -251,6 +253,18 @@ class TestSegmentBatches:
         assert np.array_equal(ops['drift_segment_used'], [0, 1])
         assert np.array_equal(ops['drift_segment_starts_used'], [0, 300])
 
+    def test_batch_time_since_segment_start(self):
+        # Batch centers, in seconds since the start of their own segment. The
+        # segment start may be before `imin` (tmin crops into a segment).
+        ops = _fake_ops()
+        ops['drift_segment_starts'] = np.array([0, 500], dtype='int64')
+        bfile = StubFile(NT=100, imin=200, n_batches=6, fs=100)
+        datashift.segment_batches(ops, bfile)
+
+        # batches start at 200, 300, 400 | 500, 600, 700; centers +50 samples
+        assert np.allclose(ops['drift_batch_time'],
+                           [2.5, 3.5, 4.5, 0.5, 1.5, 2.5])
+
     def test_fewer_than_two_segments_raises(self):
         ops = _fake_ops()
         ops['drift_segment_starts'] = np.array([0, 5000], dtype='int64')
@@ -371,6 +385,240 @@ class TestSegmentResidualDrift:
         assert ops['drift_residual'].shape[0] <= 6
 
 
+def _synthetic_shape_residuals(shapes, rows_per_seg, J=3, noise=0.5, seed=0):
+    """Residuals `intercept + amplitude * shape(phase) + noise`, quantized.
+
+    `shapes` is a list of callables on [0, 1], one per segment (repeat the same
+    one for a shared shape). Returns residual, seg, phase, and the noise-free
+    values.
+
+    """
+    rng = np.random.default_rng(seed)
+    n_seg = len(rows_per_seg)
+    intercept = rng.uniform(-3, 3, (n_seg, J))
+    amplitude = rng.uniform(2, 10, (n_seg, J)) * rng.choice([-1, 1], (n_seg, J))
+    res, seg, phase, clean = [], [], [], []
+    for s, n in enumerate(rows_per_seg):
+        p = np.linspace(0, 1, n)
+        c = intercept[s] + amplitude[s] * shapes[s](p)[:,None]
+        clean.append(c)
+        # the residual pass measures on a 0.5 um grid
+        res.append(np.round((c + rng.normal(0, noise, c.shape))/0.5)*0.5)
+        seg.append(np.full(n, s))
+        phase.append(p)
+
+    return (np.concatenate(res), np.concatenate(seg), np.concatenate(phase),
+            np.concatenate(clean))
+
+
+class TestDriftShape:
+    settle = staticmethod(lambda p: 1 - np.exp(-p/0.3))
+
+    def test_gaussian_basis(self):
+        t = np.linspace(0, 1, 8)
+        phi = datashift.gaussian_time_basis(t, (0, 1), 8)
+        assert phi.shape == (8, 8)
+        # each bump peaks at its own center
+        assert np.array_equal(np.argmax(phi, axis=0), np.arange(8))
+        assert np.allclose(np.diag(phi), 1)
+
+    def test_segment_phase(self):
+        t = np.array([0.5, 1.5, 2.5, 0.5, 1.5, 7.0])
+        seg = np.array([0, 0, 0, 1, 1, 2])
+        phase = datashift.segment_phase(t, seg, 3)
+        assert np.allclose(phase, [0, 0.5, 1, 0, 1, 0.5])
+
+    def test_recovers_shared_shape(self):
+        # Segments of different lengths share one shape, in different amounts.
+        res, seg, phase, clean = _synthetic_shape_residuals(
+            [self.settle]*6, rows_per_seg=[200, 400, 250, 300, 350, 150]
+            )
+        fit = datashift.fit_drift_shape(res, seg, phase, 6, (0, 1), rank=1,
+                                        n_basis=8, resolution=0.5)
+
+        grid = np.linspace(0, 1, 200)
+        learned = datashift.drift_shape_curves(fit, grid)[:,0]
+        true = self.settle(grid)
+        assert np.abs(np.corrcoef(learned, true)[0,1]) > 0.99
+        pred = datashift.drift_shape_model(fit, seg, phase)
+        assert np.sqrt(np.mean((pred - clean)**2)) < 0.5
+        # shapes are normalized to unit RMS over the range
+        assert np.isclose(np.sqrt(np.mean(
+            (learned - learned.mean())**2)), 1, atol=0.05)
+
+    def test_robust_to_outlier_batches(self):
+        res, seg, phase, clean = _synthetic_shape_residuals(
+            [self.settle]*6, rows_per_seg=[300]*6, seed=1
+            )
+        rng = np.random.default_rng(2)
+        bad = rng.random(res.shape[0]) < 0.05
+        res[bad] = rng.choice([-25, 25], (bad.sum(), res.shape[1]))
+        fit = datashift.fit_drift_shape(res, seg, phase, 6, (0, 1), rank=1,
+                                        n_basis=8, resolution=0.5)
+
+        pred = datashift.drift_shape_model(fit, seg, phase)
+        assert np.sqrt(np.mean((pred - clean)[~bad]**2)) < 0.8
+
+    def test_full_rank_fits_segments_independently(self):
+        # With rank == n_basis nothing is shared, so segments following
+        # different courses are all captured.
+        hump = lambda p: np.exp(-(p - 0.5)**2 / (2*0.15**2))
+        shapes = [self.settle, hump, lambda p: -p, self.settle]
+        res, seg, phase, clean = _synthetic_shape_residuals(
+            shapes, rows_per_seg=[300]*4, seed=3
+            )
+
+        full = datashift.fit_drift_shape(res, seg, phase, 4, (0, 1), rank=8,
+                                         n_basis=8, resolution=0.5)
+        shared = datashift.fit_drift_shape(res, seg, phase, 4, (0, 1), rank=1,
+                                           n_basis=8, resolution=0.5)
+        err_full = np.sqrt(np.mean(
+            (datashift.drift_shape_model(full, seg, phase) - clean)**2))
+        err_shared = np.sqrt(np.mean(
+            (datashift.drift_shape_model(shared, seg, phase) - clean)**2))
+        assert err_full < 0.5
+        assert err_full < err_shared
+
+    def test_segment_without_rows(self):
+        res, seg, phase, _ = _synthetic_shape_residuals(
+            [self.settle]*3, rows_per_seg=[200]*3
+            )
+        seg[seg == 1] = 2   # segment 1 has no rows, segment 2 has two sets
+        fit = datashift.fit_drift_shape(res, seg, phase, 3, (0, 1), rank=1,
+                                        n_basis=8)
+        assert np.all(fit['intercept'][1] == 0)
+        assert np.all(fit['amplitude'][1] == 0)
+
+    def test_rank_validation(self):
+        res, seg, phase, _ = _synthetic_shape_residuals(
+            [self.settle]*2, rows_per_seg=[50, 50], J=1
+            )
+        with pytest.raises(ValueError):
+            datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=9,
+                                      n_basis=8)
+        with pytest.raises(ValueError):
+            # only 2 segment-block series to share 3 shapes across
+            datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=3,
+                                      n_basis=8)
+        with pytest.raises(ValueError):
+            datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=0,
+                                      n_basis=8)
+
+    def test_tracks_within_segment_drift_end_to_end(self):
+        # Spikes with a different level *and* a different linear drift in each
+        # segment. With a learned shape, the estimated shift must follow the
+        # within-segment drift, with the same sign as the segment offsets.
+        np.random.seed(1234)
+        n_per, n_seg = 30, 3
+        nb = n_per * n_seg
+        level = np.array([0., 8., 4.])
+        slope = np.array([16., 8., -12.])
+        s = np.repeat(np.arange(n_seg), n_per)
+        offsets = level[s] + slope[s]*np.tile(np.linspace(0, 1, n_per), n_seg)
+
+        ops = _fake_ops(n_batches=nb, nblocks=1)
+        st = _fake_spikes(ops, spikes_per_batch=400, depth_offset=offsets)
+        ops['drift_segment_starts'] = np.array([0, 3000, 6000])
+        ops['drift_segment_diagnostics'] = True
+        bfile = StubFile(NT=100, imin=0, n_batches=nb, fs=100)
+        dd = ops['binning_depth']
+        cpu = torch.device('cpu')
+
+        imin0, _, _ = datashift.estimate_chronic_drift(
+            {**ops, 'drift_shape_rank': 0}, st, bfile, device=cpu
+            )
+        imin1, _, ops1 = datashift.estimate_chronic_drift(
+            {**ops, 'drift_shape_rank': 1, 'drift_shape_nbasis': 8}, st, bfile,
+            device=cpu
+            )
+
+        # Registration corrects drift with some sign convention; take it from
+        # the constant model, and require the shape model to agree with it.
+        sign = min([-1, 1], key=lambda g: np.std(imin0[:,0]*dd + g*offsets))
+        err0 = np.std(imin0[:,0]*dd + sign*offsets)
+        err1 = np.std(imin1[:,0]*dd + sign*offsets)
+        assert err1 < 0.5*err0
+        assert err1 < 2.0
+
+        assert ops1['drift_shape_curves'].shape == (200, 1)
+        assert ops1['drift_shape_amplitude'].shape == (n_seg, 1, 1)
+        assert ops1['drift_residual_raw'].shape == ops1['drift_residual'].shape
+        # dshift is no longer constant within segments
+        assert np.unique(imin1[:n_per], axis=0).shape[0] > 1
+
+
+class TestDriftMatrixCache:
+    def test_row_ids(self):
+        dshift = np.repeat(np.array([[0., 5.], [2., 7.]]), 5, axis=0)
+        ids = datashift.drift_row_ids(dshift, n_chan=384)
+        assert np.array_equal(ids, [0]*5 + [1]*5)
+
+    def test_row_ids_none_when_rows_vary(self):
+        dshift = np.random.rand(5000, 3)
+        assert datashift.drift_row_ids(dshift, n_chan=384) is None
+
+    def test_cache_uses_row_ids(self):
+        import kilosort.io as kio
+
+        calls = []
+        def counting(ops, shift, device=None):
+            calls.append(np.asarray(shift).copy())
+            return torch.eye(4)
+
+        bf = object.__new__(io.BinaryFiltered)
+        bf.device = torch.device('cpu')
+        bf.whiten_mat = torch.eye(4)
+        bf.dshift = np.array([[0.], [0.], [5.], [5.], [5.]])
+
+        real = kio.get_drift_matrix
+        kio.get_drift_matrix = counting
+        try:
+            bf._drift_cache = {}
+            ops = {'drift_row_id': np.array([0, 0, 1, 1, 1])}
+            for i in range(5):
+                bf._drift_whiten(ops, i)
+            assert len(calls) == 2
+
+            # no ids: no caching, one matrix per batch
+            calls.clear()
+            bf._drift_cache = {}
+            for i in range(5):
+                bf._drift_whiten({'drift_row_id': None}, i)
+            assert len(calls) == 5
+            assert bf._drift_cache == {}
+        finally:
+            kio.get_drift_matrix = real
+
+
+class TestInitializeOps:
+    probe = {'chanMap': np.arange(16), 'xc': np.zeros(16),
+             'yc': np.arange(16)*20., 'kcoords': np.zeros(16), 'n_chan': 16}
+
+    def _init(self, **kw):
+        from kilosort import DEFAULT_SETTINGS
+        from kilosort.run_kilosort import initialize_ops
+        settings = {**DEFAULT_SETTINGS, 'n_chan_bin': 16, **kw}
+        return initialize_ops(settings, self.probe, 'int16', True, False,
+                              torch.device('cpu'), False)
+
+    def test_segments_parsed_and_settings_kept(self, tmp_path):
+        p = tmp_path / 'segments.txt'
+        p.write_text('0\n1000\n')
+        ops, _ = self._init(drift_segment_starts=str(p))
+        assert np.array_equal(ops['drift_segment_starts'], [0, 1000])
+        assert ops['settings']['drift_segment_starts'] == str(p)
+        assert ops['drift_shape_rank'] == 0
+
+    def test_shape_rank_exceeding_nbasis_raises(self):
+        with pytest.raises(ValueError):
+            self._init(drift_segment_starts=[0, 1000], drift_shape_rank=9,
+                       drift_shape_nbasis=8)
+
+    def test_negative_rank_raises(self):
+        with pytest.raises(ValueError):
+            self._init(drift_segment_starts=[0, 1000], drift_shape_rank=-1)
+
+
 class TestPlots:
     def test_segment_boundary_times(self):
         from kilosort import plots
@@ -389,6 +637,73 @@ class TestPlots:
         from kilosort import plots
         assert plots.segment_boundary_times({'batch_to_segment': None}) is None
         assert plots.segment_boundary_times({}) is None
+
+    def test_chronic_plot_variants(self, tmp_path):
+        # Constant model without diagnostics, constant with diagnostics, and
+        # with a learned shape, must all produce a figure.
+        from kilosort import plots
+
+        seg = np.repeat([0, 1, 2], 10)
+        base = {
+            'dshift': np.random.rand(30, 3),
+            'batch_to_segment': seg,
+            'drift_segment_used': np.arange(3),
+            'binning_depth': 5,
+            'settings': {'fs': 30000, 'batch_size': 60000},
+            }
+        residual = {
+            'drift_residual': np.random.randn(30, 3),
+            'drift_residual_batches': np.arange(30),
+            }
+        shape = {
+            'drift_shape_time_grid': np.linspace(0, 1, 200),
+            'drift_shape_curves': np.random.randn(200, 2),
+            }
+        for i, ops in enumerate([base, {**base, **residual},
+                                 {**base, **residual, **shape}]):
+            out = tmp_path / str(i)
+            out.mkdir()
+            plots.plot_chronic_drift(ops, out, tmin=0)
+            assert (out / 'drift_segments.png').is_file()
+
+    def test_corrected_spike_depths(self):
+        from kilosort import plots
+
+        # columns: time, depth, amplitude, _, batch
+        st0 = np.array([
+            [0.0,   0.0, 20, 0, 0],   # below the lowest block: extrapolated
+            [0.0, 150.0, 20, 0, 0],   # halfway between blocks
+            [2.0, 100.0, 20, 0, 1],   # on a block center
+            ])
+        ops = {'dshift': np.array([[10.0, 30.0], [-5.0, 0.0]]),
+               'yblk': np.array([100.0, 200.0])}
+        y = plots.corrected_spike_depths(st0, ops)
+        assert np.allclose(y, [0 - 10, 150 + 20, 100 - 5])
+
+        ops1 = {'dshift': np.array([[3.0], [-4.0]]), 'yblk': np.array([50.0])}
+        assert np.allclose(plots.corrected_spike_depths(st0, ops1),
+                           [3, 153, 96])
+
+    def test_corrected_scatter_saved(self, tmp_path):
+        from kilosort import plots
+
+        rng = np.random.default_rng(0)
+        n = 500
+        st0 = np.zeros((n, 6))
+        st0[:,0] = np.sort(rng.uniform(0, 60, n))
+        st0[:,1] = rng.uniform(0, 400, n)
+        st0[:,2] = rng.uniform(5, 150, n)
+        st0[:,4] = np.minimum(st0[:,0] // 2, 29)
+        amp = st0[:,2].copy()
+        ops = {
+            'dshift': rng.normal(size=(30, 3)),
+            'yblk': np.array([50.0, 200.0, 350.0]),
+            'batch_to_segment': np.repeat([0, 1, 2], 10),
+            'settings': {'fs': 30000, 'batch_size': 60000},
+            }
+        plots.plot_drift_scatter_corrected(st0, ops, tmp_path, tmin=0)
+        assert (tmp_path / 'drift_scatter_corrected.png').is_file()
+        assert np.array_equal(st0[:,2], amp)
 
 
 @pytest.mark.slow
@@ -445,6 +760,35 @@ class TestEndToEnd:
             rows = ops['dshift'][seg == s]
             assert np.all(rows == rows[0])
         assert ops['drift_residual'].shape[1] == 2*ops['nblocks'] - 1
+        assert ops['drift_row_id'] is not None
+        assert (results_dir / 'drift_segments.png').is_file()
+
+    def test_chronic_run_with_learned_shape(self, data_directory, torch_device,
+                                            tmp_path):
+        from kilosort import run_kilosort
+
+        bin_file = data_directory / 'ZFM-02370_mini.imec0.ap.short.bin'
+        n_samples = io.get_total_samples(bin_file, 385, 'int16')
+        starts = [0, int(n_samples/3), int(2*n_samples/3)]
+        results_dir = tmp_path / 'chronic_shape'
+
+        ops, *_ = run_kilosort.run_kilosort(
+            filename=bin_file, device=torch_device,
+            settings={'n_chan_bin': 385, 'nblocks': 1,
+                      'drift_segment_starts': starts, 'drift_shape_rank': 1,
+                      'drift_shape_nbasis': 8},
+            probe_name='NeuroPix1_default.mat', results_dir=results_dir
+            )
+
+        J = 2*ops['nblocks'] - 1
+        assert ops['dshift'].shape == (ops['Nbatches'], J)
+        assert ops['drift_shape_curves'].shape == (200, 1)
+        assert ops['drift_shape_amplitude'].shape == (3, J, 1)
+        assert ops['drift_shape_model'].shape == ops['dshift'].shape
+        # the segment offsets plus the model make up dshift
+        seg = ops['batch_to_segment']
+        expected = ops['drift_segment_shift'][seg] + ops['drift_shape_model']
+        assert np.allclose(ops['dshift'], expected)
         assert (results_dir / 'drift_segments.png').is_file()
 
     def test_standard_run_sets_no_segments(self, data_directory, torch_device,

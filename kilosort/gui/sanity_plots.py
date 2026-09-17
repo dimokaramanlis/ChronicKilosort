@@ -81,12 +81,15 @@ def plot_chronic_drift(plot_window, ops, settings):
     dd = ops['binning_depth']
     t = np.arange(dshift.shape[0])*(NT/fs) + settings['tmin']
     residual = ops.get('drift_residual', None)
+    curves = ops.get('drift_shape_curves', None)
+    has_shape = curves is not None
 
     p1 = plot_window.plot_widget.addPlot(
         row=0, col=0, labels={'left': 'Depth shift (um)', 'bottom': 'Time (s)'}
         )
     n_seg = ops['drift_segment_used'].size
-    p1.setTitle(f'Drift per segment ({n_seg} segments, {dshift.shape[1]} blocks)')
+    title = 'Drift per segment' + (' with learned shape' if has_shape else '')
+    p1.setTitle(f'{title} ({n_seg} segments, {dshift.shape[1]} blocks)')
     for i in range(dshift.shape[1]):
         color = COLOR_CODES[i % len(COLOR_CODES)]
         # dshift is already piecewise constant, so a plain line shows
@@ -99,7 +102,8 @@ def plot_chronic_drift(plot_window, ops, settings):
             row=1, col=0,
             labels={'left': 'Residual shift (um)', 'bottom': 'Time (s)'}
             )
-        p2.setTitle('Within-segment residual drift '
+        after = ' after learned shape' if has_shape else ''
+        p2.setTitle(f'Within-segment residual drift{after} '
                     f'(dashed band: +/- binning_depth = {dd} um)')
         tr = ops['drift_residual_batches']*(NT/fs) + settings['tmin']
         for i in range(residual.shape[1]):
@@ -110,6 +114,20 @@ def plot_chronic_drift(plot_window, ops, settings):
             p2.addItem(pg.InfiniteLine(pos=y, angle=0, pen=band))
         _add_segment_boundaries(p2, ops, settings)
         p2.setXLink(p1)
+
+    if has_shape:
+        p3 = plot_window.plot_widget.addPlot(
+            row=1 + (residual is not None), col=0,
+            labels={'left': 'Shape (unit RMS)',
+                    'bottom': 'Position within segment (0 = first batch, 1 = last)'}
+            )
+        p3.setTitle('Learned within-segment drift shape')
+        grid = ops['drift_shape_time_grid']
+        for k in range(curves.shape[1]):
+            color = COLOR_CODES[k % len(COLOR_CODES)]
+            p3.plot(grid, curves[:,k], pen=color)
+        p3.addItem(pg.InfiniteLine(pos=0, angle=0,
+                                   pen=pg.mkPen(color=(128, 128, 128))))
 
     plot_window.show()
     save_path = str(Path(settings['results_dir']) / 'drift_segments.png')

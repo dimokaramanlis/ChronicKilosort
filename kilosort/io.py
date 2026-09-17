@@ -1040,6 +1040,7 @@ class BinaryFiltered(BinaryRWFile):
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
         # Only used for chronic drift correction, see `_drift_whiten`.
+        # Keyed by `ops['drift_row_id']`.
         self._drift_cache = {}
 
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
@@ -1079,20 +1080,22 @@ class BinaryFiltered(BinaryRWFile):
         return X
 
     def _drift_whiten(self, ops, ibatch):
-        """`M @ whiten_mat` for this batch, cached when drift is segment-wise.
+        """`M @ whiten_mat` for this batch, cached when many rows are identical.
 
-        In chronic drift mode every batch of a segment has the same `dshift`
-        row, so this product is otherwise recomputed identically thousands of
-        times. The cache is bounded by the number of segments.
+        With constant per-segment drift every batch of a segment has the same
+        `dshift` row, so this product is otherwise recomputed identically
+        thousands of times. `ops['drift_row_id']` labels identical rows, and is
+        None whenever caching would not pay off (per-batch drift, or a learned
+        within-segment shape), so the cache stays bounded.
 
         """
         row = self.dshift[ibatch]
-        seg = ops.get('batch_to_segment', None)
-        if seg is None:
-            # Per-batch drift: every row differs, caching would only waste memory.
+        row_id = ops.get('drift_row_id', None)
+        if row_id is None:
+            # Rows differ between batches, caching would only waste memory.
             return get_drift_matrix(ops, row, device=self.device) @ self.whiten_mat
 
-        key = int(seg[ibatch])
+        key = int(row_id[ibatch])
         MW = self._drift_cache.get(key)
         if MW is None:
             MW = get_drift_matrix(ops, row, device=self.device) @ self.whiten_mat

@@ -257,6 +257,36 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'drift_shape_rank': {
+        'gui_name': 'drift shape rank', 'type': int, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 0, 'step': 'preprocessing',
+        'description':
+            """
+            When `drift_segment_starts` is set, number of smooth within-segment
+            drift shapes shared by all segments. Each shape is a curve over the
+            course of a segment (from its first to its last batch, so segments
+            of different lengths are stretched to match). Each segment gets its
+            own offset plus its own amount of each shape, so for example a rank
+            of 1 can capture drift that follows the same course every day but
+            by a different amount. The shapes are learned from the data.
+            Setting this equal to `drift_shape_nbasis` fits every segment
+            independently. 0 (default) holds drift constant within each
+            segment. Has no effect otherwise.
+            """
+    },
+
+    'drift_shape_nbasis': {
+        'gui_name': 'drift shape nbasis', 'type': int, 'min': 2,
+        'max': np.inf, 'exclude': [], 'default': 8, 'step': 'preprocessing',
+        'description':
+            """
+            Number of Gaussian bumps, evenly spaced across each segment, used
+            to build each learned drift shape. Fewer bumps
+            give smoother shapes. Must be at least `drift_shape_rank`. Has no
+            effect unless `drift_shape_rank` > 0.
+            """
+    },
+
 
     ### SPIKE DETECTION
     # NOTE: if left as None, will be set to `int(20 * settings['nt']/61)`

@@ -154,6 +154,50 @@ residual (bottom, with a shaded ±`binning_depth` band). Two warnings can be rai
 The residuals are stored in `ops['drift_residual']`, `ops['drift_residual_batches']`, and
 `ops['drift_residual_summary']` (`[median, std, p5, p95]` per segment and block, in microns).
 
+### Learned within-segment drift shape
+
+If the diagnostics show drift *within* each day, for example the probe settling after the animal is
+handled, you can model it instead of splitting days into shorter segments. Each segment then gets its
+offset plus a smooth curve over the course of the segment:
+
+~~~
+shift(batch, block) = offset(segment, block) + Σ_k amount_k(segment, block) · shape_k(position in segment)
+~~~
+
+The shapes are **learned from the data and shared by all segments**. Each segment only gets its own
+*amount* of each shape, which keeps the model low-rank and well-determined. Each shape is a weighted sum
+of `drift_shape_nbasis` Gaussian bumps spanning each segment from its first batch (0) to its last (1),
+so the curves are smooth by construction, and segments of different lengths are stretched to match.
+
+~~~python
+settings = {
+    ...
+    'drift_segment_starts': 'D:/data/segments.txt',
+    'drift_shape_rank': 1,      # number of shared shapes; 0 (default) = constant per segment
+    'drift_shape_nbasis': 8,    # Gaussian bumps per shape; fewer = smoother
+}
+~~~
+
+In the GUI both settings are in **Extra settings**, under *preprocessing*.
+
+* `drift_shape_rank = 1` suits drift that follows the same course every day by different amounts.
+  Raise it if days follow genuinely different courses. `drift_shape_rank = drift_shape_nbasis` fits
+  every segment independently, with nothing shared.
+* The fit uses the per-batch residuals from the diagnostic pass (at most 2000 batches per segment),
+  with robust weighting against outlier batches. On CPU it adds about 5 s for 20 daily segments with
+  `nblocks = 5` at rank 1 (roughly linear in segments and in rank), and memory still scales with the
+  number of segments rather than batches.
+* The log reports each segment's within-segment drift range, and how much the model reduces the
+  residual on **held-out batches** compared with a constant per segment. If it doesn't reduce it, you get
+  a warning that the shape is probably fitting noise.
+* The residual table and the middle panel of `drift_segments.png` then show the residual *after* the
+  model, and a bottom panel shows the learned shapes. The fit is stored in `ops['drift_shape_curves']`,
+  `ops['drift_shape_amplitude']` (µm per unit-RMS shape), `ops['drift_shape_intercept']`, and
+  `ops['drift_shape_model']` (the within-segment part of `dshift`).
+
+Because drift now varies within a segment, the per-segment drift-matrix cache is switched off in this
+mode, so preprocessing costs the same as standard Kilosort4.
+
 ### What this does and does not do
 
 * It is **not** unit tracking or matching across days. It aligns the days into a common depth frame

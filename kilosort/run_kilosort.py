@@ -298,6 +298,8 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             else:
                 kplots.plot_drift_amount(ops, results_dir, tmin=settings['tmin'])
                 kplots.plot_drift_scatter(st0, results_dir, tmin=settings['tmin'])
+                kplots.plot_drift_scatter_corrected(st0, ops, results_dir,
+                                                    tmin=settings['tmin'])
                 if ops.get('batch_to_segment', None) is not None:
                     kplots.plot_chronic_drift(ops, results_dir,
                                               tmin=settings['tmin'])
@@ -573,6 +575,29 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
                     'segments requested.')
     else:
         ops['drift_segment_starts'] = None
+
+    rank = settings.get('drift_shape_rank', 0)
+    rank = 0 if rank is None else int(rank)
+    n_basis = int(settings.get('drift_shape_nbasis', 8))
+    ops['drift_shape_rank'] = rank
+    ops['drift_shape_nbasis'] = n_basis
+    if rank < 0:
+        raise ValueError(f'`drift_shape_rank` must be >= 0, got {rank}.')
+    if rank > 0:
+        if seg is None:
+            warnings.warn(
+                '`drift_shape_rank` > 0 has no effect unless '
+                '`drift_segment_starts` is set.', UserWarning
+                )
+        if n_basis < 2:
+            raise ValueError(
+                f'`drift_shape_nbasis` must be at least 2, got {n_basis}.'
+                )
+        if rank > n_basis:
+            raise ValueError(
+                f'`drift_shape_rank` ({rank}) cannot exceed '
+                f'`drift_shape_nbasis` ({n_basis}).'
+                )
 
     return ops, settings
 

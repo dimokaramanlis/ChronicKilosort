@@ -225,7 +225,7 @@ class RunBox(QtWidgets.QGroupBox):
                     background='w'
                     ),
                 'chronic_drift': PlotWindow(
-                    nrows=2, ncols=1, width=900, height=700,
+                    nrows=3, ncols=1, width=900, height=950,
                     title='Chronic Drift'
                     ),
                 'diagnostics': PlotWindow(

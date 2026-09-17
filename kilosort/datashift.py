@@ -304,6 +304,12 @@ def segment_batches(ops, bfile):
     seg_last = np.searchsorted(starts, last, side='right') - 1
     straddles = seg_first != seg_last
 
+    # Time of each batch's center since the start of its segment, in seconds.
+    # Used by the learned within-segment drift shape (`drift_shape_rank`). Each
+    # sorted batch reads bfile.NT samples starting at `first`.
+    center = first + np.int64(bfile.NT)//2
+    ops['drift_batch_time'] = (center - starts[seg_first]) / bfile.fs
+
     # tmin/tmax may crop whole segments away; drop empty ones and relabel 0..k-1
     used, seg_of_batch = np.unique(seg_first, return_inverse=True)
     seg_of_batch = seg_of_batch.reshape(-1).astype('int64')
@@ -329,7 +335,8 @@ def segment_batches(ops, bfile):
 
 
 def segment_residual_drift(ops, st, seg_of_batch, straddles, F_seg, ysamp,
-                           device=torch.device('cuda'), max_batches=2000):
+                           device=torch.device('cuda'), max_batches=2000,
+                           log=True):
     """Estimate per-batch residual shift relative to each segment's fingerprint.
 
     This tests the assumption that chronic mode makes: if drift really is
@@ -362,6 +369,10 @@ def segment_residual_drift(ops, st, seg_of_batch, straddles, F_seg, ysamp,
     max_batches : int; default=2000.
         Maximum number of batches evaluated per segment. Larger segments are
         subsampled evenly, so that memory and runtime stay bounded.
+    log : bool; default=True.
+        If True, log the summary table and warn if the constant-per-segment
+        assumption is violated. `estimate_chronic_drift` turns this off so it
+        can report the residual after the learned shape model instead.
 
     Returns
     -------
@@ -386,7 +397,6 @@ def segment_residual_drift(ops, st, seg_of_batch, straddles, F_seg, ysamp,
     sp_batch = st[:,4].astype('int64')
     all_res = []
     all_batches = []
-    summary = np.full((n_seg, nblocks_eff, 4), np.nan)
 
     # One segment at a time, so that peak memory is max_batches x dmax x 20
     # floats rather than Nbatches x dmax x 20. Doing it any other way would
@@ -431,11 +441,6 @@ def segment_residual_drift(ops, st, seg_of_batch, straddles, F_seg, ysamp,
             dcup = Kn.T @ dcs[:,:,j]
             res[:,j] = dtup[np.argmax(dcup, 0)] * dd
 
-        summary[s,:,0] = np.median(res, axis=0)
-        summary[s,:,1] = np.std(res, axis=0)
-        summary[s,:,2] = np.percentile(res, 5, axis=0)
-        summary[s,:,3] = np.percentile(res, 95, axis=0)
-
         all_res.append(res)
         all_batches.append(batches)
 
@@ -445,11 +450,49 @@ def segment_residual_drift(ops, st, seg_of_batch, straddles, F_seg, ysamp,
 
     ops['drift_residual'] = np.concatenate(all_res, axis=0)
     ops['drift_residual_batches'] = np.concatenate(all_batches, axis=0)
-    ops['drift_residual_summary'] = summary
+    ops['drift_residual_summary'] = residual_summary(
+        ops['drift_residual'], ops['drift_residual_batches'], seg_of_batch, n_seg
+        )
 
-    _log_residual_summary(ops, summary, seg_of_batch, straddles)
+    if log:
+        _log_residual_summary(ops, ops['drift_residual_summary'], seg_of_batch,
+                              straddles)
 
     return ops
+
+
+def residual_summary(residual, batches, seg_of_batch, n_seg):
+    """Per-segment [median, std, p5, p95] of residual drift, in microns.
+
+    Parameters
+    ----------
+    residual : np.ndarray
+        Residual shift of each sampled batch, shape (n_sampled, nblocks_eff).
+    batches : np.ndarray
+        Batch index of each row of `residual`.
+    seg_of_batch : np.ndarray
+        Segment index of each batch.
+    n_seg : int
+        Number of segments.
+
+    Returns
+    -------
+    summary : np.ndarray
+        Shape (n_seg, nblocks_eff, 4). Segments without sampled batches are NaN.
+
+    """
+    summary = np.full((n_seg, residual.shape[1], 4), np.nan)
+    seg_r = seg_of_batch[batches]
+    for s in range(n_seg):
+        res = residual[seg_r == s]
+        if res.shape[0] == 0:
+            continue
+        summary[s,:,0] = np.median(res, axis=0)
+        summary[s,:,1] = np.std(res, axis=0)
+        summary[s,:,2] = np.percentile(res, 5, axis=0)
+        summary[s,:,3] = np.percentile(res, 95, axis=0)
+
+    return summary
 
 
 def _log_residual_summary(ops, summary, seg_of_batch, straddles):
@@ -461,8 +504,13 @@ def _log_residual_summary(ops, summary, seg_of_batch, straddles):
     tol = max(ops['binning_depth'], 0.5*ops['sig_interp'])
     n_seg = summary.shape[0]
     used = ops.get('drift_segment_used', np.arange(n_seg))
+    has_shape = ops.get('drift_shape_weights', None) is not None
 
-    logger.info('Within-segment residual drift (worst block per segment):')
+    if has_shape:
+        logger.info('Within-segment residual drift after the learned shape '
+                    '(worst block per segment):')
+    else:
+        logger.info('Within-segment residual drift (worst block per segment):')
     logger.info('  seg  batches  median(um)       p5-p95(um)  max|res|(um)')
     spread_bad = []
     bias_bad = []
@@ -483,11 +531,22 @@ def _log_residual_summary(ops, summary, seg_of_batch, straddles):
 
     if len(spread_bad) > 0:
         seg_txt = ', '.join([f'{s} ({v:.1f} um)' for s, v in spread_bad])
+        if has_shape:
+            model_txt = (
+                'The learned within-segment shape does not capture the drift '
+                'in those segments. Try increasing `drift_shape_rank` or '
+                '`drift_shape_nbasis`, splitting them into shorter segments, '
+                )
+        else:
+            model_txt = (
+                'Drift is not constant within those segments, so the chronic '
+                'model is a poor fit for them. Try a learned within-segment '
+                'shape (`drift_shape_rank = 1`), splitting them into shorter '
+                'segments, '
+                )
         warnings.warn(
             f'Within-segment residual drift exceeds {tol:.1f} um (p5-p95) for '
-            f'segment(s): {seg_txt}. Drift is not constant within those '
-            'segments, so the chronic model is a poor fit for them. Either '
-            'split them into shorter segments, or use standard per-batch '
+            f'segment(s): {seg_txt}. {model_txt}or use standard per-batch '
             'drift correction (`drift_segment_starts = None`).',
             UserWarning
             )
@@ -504,6 +563,474 @@ def _log_residual_summary(ops, summary, seg_of_batch, straddles):
             'drift_segments.png before trusting across-segment unit identity.',
             UserWarning
             )
+
+
+def gaussian_time_basis(t, time_range, n_basis):
+    """Gaussian bumps evenly spaced across `time_range`.
+
+    Adjacent bumps are one standard deviation apart, so they overlap enough
+    that weighting them gives a smooth curve, and no weighting can produce
+    variation faster than the bump width.
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Times at which to evaluate the basis, in seconds.
+    time_range : tuple of float
+        (first, last) bump center.
+    n_basis : int
+        Number of bumps, at least 2.
+
+    Returns
+    -------
+    phi : np.ndarray
+        Shape (len(t), n_basis).
+
+    """
+    t = np.asarray(t, dtype='float64')
+    t0, t1 = float(time_range[0]), float(time_range[1])
+    centers = np.linspace(t0, t1, n_basis)
+    width = (t1 - t0) / (n_basis - 1)
+    if width <= 0:
+        width = 1.0
+    return np.exp(-(t[:,None] - centers)**2 / (2*width**2))
+
+
+def _weighted_ridge(X, w, Y, ridge):
+    """Weighted ridge regressions of each column of `Y` on a shared design.
+
+    X is (n, P), w and Y are (n, J). Returns coefficients of shape (J, P). The
+    first column of X is an intercept and is not penalized. The penalty is
+    scaled by the average diagonal of X'WX, so `ridge` does not depend on
+    units or on the number of rows.
+
+    """
+    P = X.shape[1]
+    XtWX = np.einsum('np,nj,nq->jpq', X, w, X)
+    XtWy = np.einsum('np,nj->jp', X, w*Y)
+    scale = np.trace(XtWX, axis1=1, axis2=2) / P
+    penalty = np.eye(P)
+    penalty[0,0] = 0
+    lhs = XtWX + ridge*scale[:,None,None]*penalty + 1e-12*np.eye(P)
+    return np.linalg.solve(lhs, XtWy[...,None])[...,0]
+
+
+def _huber_weights(err, resolution, c=1.345):
+    """Huber IRLS weights, with the scale taken from the median absolute deviation.
+
+    Per-batch residuals are argmax estimates, so a small fraction are far off
+    (for example batches with few spikes). `resolution` floors the scale,
+    because quantized residuals can have a median absolute deviation of 0.
+
+    """
+    scale = 1.4826 * np.median(np.abs(err - np.median(err)))
+    scale = max(scale, resolution)
+    a = np.abs(err) / scale
+    return np.where(a <= c, 1.0, c / np.maximum(a, 1e-12))
+
+
+def _normalize_shapes(W, phi_grid, fallback=None):
+    """Make shapes orthogonal with unit RMS over the time range, and fix signs.
+
+    The model is invariant to rescaling a shape and its amplitudes in
+    opposite directions, so this pins down a unique, interpretable scale:
+    amplitudes are then in microns per unit-RMS shape.
+
+    """
+    G = phi_grid @ W.T
+    n = G.shape[0]
+    _, R = np.linalg.qr(G / np.sqrt(n))
+    if np.any(np.abs(np.diag(R)) < 1e-12):
+        # Degenerate (e.g. no within-segment drift at all), keep previous shapes.
+        return W if fallback is None else fallback
+    W = np.linalg.solve(R.T, W)
+
+    # Sign convention: shapes increase from the start to the end of the range,
+    # or are positive at their peak if they start and end at the same level.
+    G = phi_grid @ W.T
+    for k in range(W.shape[0]):
+        sign = np.sign(G[-1,k] - G[0,k])
+        if sign == 0:
+            sign = np.sign(G[np.argmax(np.abs(G[:,k])), k])
+        if sign < 0:
+            W[k] = -W[k]
+
+    return W
+
+
+def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
+                    resolution=0.5, max_iter=50, tol=1e-6, ridge=1e-3):
+    """Fit a low-rank, smooth within-segment drift model to residual drift.
+
+    The model for row `n` (a batch in segment `s`) and depth block `j` is
+
+        residual[n, j] = intercept[s, j]
+                         + sum_k amplitude[s, j, k] * g_k(t[n])
+
+    where the shapes `g_k` are shared by all segments and blocks, and are
+    weighted sums of Gaussian bumps across time, `g_k = sum_m weights[k, m] *
+    phi_m`. The basis is mean-subtracted over the time range, so that a
+    constant cannot hide in a shape; per-segment levels go in `intercept`.
+
+    Fitting alternates between per-segment weighted least squares for
+    (intercept, amplitude) given the shapes, and a single weighted least
+    squares for the shape weights given the amplitudes, with Huber weights
+    updated in between. It is initialized with the leading singular vectors of
+    unconstrained per-segment bump fits.
+
+    Parameters
+    ----------
+    residual : np.ndarray
+        Residual shift in microns, shape (n, J).
+    seg : np.ndarray
+        Segment index of each row, in [0, n_seg).
+    t : np.ndarray
+        Time of each row within its segment. `apply_drift_shape` uses the
+        position within the segment (0 to 1), so that the bumps span each
+        segment separately.
+    n_seg : int
+        Number of segments. Segments without rows get zero intercept and
+        amplitude.
+    time_range : tuple of float
+        Time range covered by the basis. Should include every time the model
+        will be evaluated at.
+    rank : int; default=1.
+        Number of shared shapes.
+    n_basis : int; default=8.
+        Number of Gaussian bumps per shape.
+    resolution : float; default=0.5.
+        Smallest meaningful residual, in microns. Floors the robust scale.
+    max_iter : int; default=50.
+    tol : float; default=1e-6.
+        Stop when shape weights change by less than this.
+    ridge : float; default=1e-3.
+        Relative ridge penalty on amplitudes and shape weights.
+
+    Returns
+    -------
+    fit : dict
+        'intercept' (n_seg, J), 'amplitude' (n_seg, J, rank) in microns per
+        unit-RMS shape, 'weights' (rank, n_basis), 'basis_mean' (n_basis,),
+        'time_range' (2,), 'n_iter'.
+
+    """
+    residual = np.asarray(residual, dtype='float64')
+    if residual.ndim == 1:
+        residual = residual[:,None]
+    seg = np.asarray(seg, dtype='int64')
+    N, J = residual.shape
+    K, M = int(rank), int(n_basis)
+    if M < 2:
+        raise ValueError(f'`n_basis` must be at least 2, got {M}.')
+    if K < 1 or K > min(M, n_seg*J):
+        raise ValueError(
+            f'`rank` must be between 1 and min(n_basis, n_segments * n_blocks) '
+            f'= {min(M, n_seg*J)}, got {K}.'
+            )
+
+    time_range = (float(time_range[0]), float(time_range[1]))
+    t_grid = np.linspace(time_range[0], time_range[1], 512)
+    phi_grid = gaussian_time_basis(t_grid, time_range, M)
+    basis_mean = phi_grid.mean(0)
+    phi_grid = phi_grid - basis_mean
+    phi = gaussian_time_basis(t, time_range, M) - basis_mean
+    rows = [np.flatnonzero(seg == s) for s in range(n_seg)]
+    ones = np.ones((N, 1))
+    w = np.ones((N, J))
+
+    # Initialize with the dominant shapes of unconstrained per-segment fits.
+    X = np.concatenate([ones, phi], 1)
+    B = np.zeros((n_seg, J, M))
+    for s, idx in enumerate(rows):
+        if idx.size > 0:
+            B[s] = _weighted_ridge(X[idx], w[idx], residual[idx], ridge)[:,1:]
+    _, _, Vt = np.linalg.svd(B.reshape(n_seg*J, M), full_matrices=False)
+    W = _normalize_shapes(Vt[:K], phi_grid)
+
+    def segment_step(W, w):
+        G = phi @ W.T
+        X = np.concatenate([ones, G], 1)
+        coef = np.zeros((n_seg, J, 1+K))
+        for s, idx in enumerate(rows):
+            if idx.size > 0:
+                coef[s] = _weighted_ridge(X[idx], w[idx], residual[idx], ridge)
+        return G, coef[...,0], coef[...,1:]
+
+    n_iter = 0
+    for n_iter in range(1, max_iter+1):
+        # intercepts and amplitudes, given the shapes
+        G, intercept, amplitude = segment_step(W, w)
+        err = residual - intercept[seg] - np.einsum('njk,nk->nj', amplitude[seg], G)
+        w = _huber_weights(err, resolution)
+
+        # Shape weights, given intercepts and amplitudes. The design row for
+        # (n, j) is kron(amplitude[s, j], phi[n]); accumulate normal equations
+        # per segment to avoid materializing it.
+        XtX = np.zeros((K*M, K*M))
+        Xty = np.zeros(K*M)
+        for s, idx in enumerate(rows):
+            if idx.size == 0:
+                continue
+            P = phi[idx]
+            ws = w[idx]
+            ys = residual[idx] - intercept[s]
+            PtWP = np.einsum('nm,nj,np->jmp', P, ws, P)
+            PtWy = np.einsum('nm,nj->jm', P, ws*ys)
+            a = amplitude[s]
+            XtX += np.einsum('jk,jl,jmp->kmlp', a, a, PtWP).reshape(K*M, K*M)
+            Xty += np.einsum('jk,jm->km', a, PtWy).reshape(K*M)
+        lam = ridge*np.trace(XtX)/(K*M) + 1e-12
+        W_new = np.linalg.solve(XtX + lam*np.eye(K*M), Xty).reshape(K, M)
+        W_new = _normalize_shapes(W_new, phi_grid, fallback=W)
+
+        change = np.max(np.abs(W_new - W))
+        W = W_new
+        if change < tol:
+            break
+
+    G, intercept, amplitude = segment_step(W, w)
+
+    # Order shapes by how much drift they account for.
+    order = np.argsort(-np.sum(amplitude**2, axis=(0,1)))
+    W = W[order]
+    amplitude = amplitude[..., order]
+
+    return {
+        'intercept': intercept, 'amplitude': amplitude, 'weights': W,
+        'basis_mean': basis_mean, 'time_range': np.array(time_range),
+        'n_iter': n_iter,
+        }
+
+
+def drift_shape_curves(fit, t):
+    """Evaluate the learned shapes at times `t`. Returns (len(t), rank)."""
+    W = fit['weights']
+    phi = gaussian_time_basis(t, fit['time_range'], W.shape[1]) - fit['basis_mean']
+    return phi @ W.T
+
+
+def drift_shape_model(fit, seg, t):
+    """Within-segment drift predicted by `fit`, in microns. Returns (len(t), J)."""
+    G = drift_shape_curves(fit, t)
+    seg = np.asarray(seg, dtype='int64')
+    return fit['intercept'][seg] + np.einsum('njk,nk->nj', fit['amplitude'][seg], G)
+
+
+def segment_phase(t, seg_of_batch, n_seg):
+    """Position of each batch within its segment, from 0 (first) to 1 (last).
+
+    Parameters
+    ----------
+    t : np.ndarray
+        Time of each batch, in any units that increase within a segment.
+    seg_of_batch : np.ndarray
+        Segment index of each batch.
+    n_seg : int
+
+    Returns
+    -------
+    phase : np.ndarray
+        Same shape as `t`. Segments with a single batch get 0.5.
+
+    """
+    t = np.asarray(t, dtype='float64')
+    phase = np.full(t.shape, 0.5)
+    for s in range(n_seg):
+        idx = seg_of_batch == s
+        if not np.any(idx):
+            continue
+        t0, t1 = t[idx].min(), t[idx].max()
+        if t1 > t0:
+            phase[idx] = (t[idx] - t0) / (t1 - t0)
+
+    return phase
+
+
+def apply_drift_shape(ops, seg_of_batch, n_seg):
+    """Fit the learned within-segment shape and evaluate it for every batch.
+
+    Uses the per-batch residuals from `segment_residual_drift`. Those are
+    measured against each segment's own pooled fingerprint in the same roll
+    convention as `align_block2`, so the total shift of a batch is the segment
+    shift plus the modeled residual.
+
+    Stores the fit in `ops` (keys starting with 'drift_shape_'), keeps the raw
+    residual in 'drift_residual_raw', and replaces 'drift_residual' and
+    'drift_residual_summary' with the residual left after the model.
+
+    Returns
+    -------
+    ops : dict
+    model : np.ndarray
+        Within-segment drift for every batch, (Nbatches, nblocks_eff) microns.
+
+    """
+    rank = int(ops['drift_shape_rank'])
+    n_basis = int(ops.get('drift_shape_nbasis', 8))
+    residual = ops['drift_residual']
+    batches = ops['drift_residual_batches']
+    # The bumps span each segment separately: time is the position within the
+    # segment, from its first batch (0) to its last (1), computed over every
+    # batch so that the model is never extrapolated.
+    t_all = segment_phase(ops['drift_batch_time'], seg_of_batch, n_seg)
+    ops['drift_batch_phase'] = t_all
+    time_range = (0.0, 1.0)
+    resolution = 0.1 * ops['binning_depth']   # the x10 upsampled search grid
+    seg_r = seg_of_batch[batches]
+    t_r = t_all[batches]
+    J = residual.shape[1]
+
+    # Held-out check: fit on every other sampled batch, and compare the error
+    # on the rest against a constant per segment fit to the same batches.
+    improvement = np.nan
+    if batches.size >= 4:
+        train = (np.arange(batches.size) % 2) == 0
+        test = ~train
+        fit_train = fit_drift_shape(
+            residual[train], seg_r[train], t_r[train], n_seg, time_range,
+            rank=rank, n_basis=n_basis, resolution=resolution
+            )
+        const = np.zeros((n_seg, J))
+        for s in range(n_seg):
+            r = residual[train][seg_r[train] == s]
+            if r.shape[0] > 0:
+                const[s] = np.median(r, axis=0)
+        pred = drift_shape_model(fit_train, seg_r[test], t_r[test])
+        err_model = np.abs(residual[test] - pred).mean()
+        err_const = np.abs(residual[test] - const[seg_r[test]]).mean()
+        if err_const > 0:
+            improvement = 1 - err_model/err_const
+
+    fit = fit_drift_shape(residual, seg_r, t_r, n_seg, time_range, rank=rank,
+                          n_basis=n_basis, resolution=resolution)
+    model = drift_shape_model(fit, seg_of_batch, t_all)
+
+    t_grid = np.linspace(time_range[0], time_range[1], 200)
+    ops['drift_shape_intercept'] = fit['intercept']
+    ops['drift_shape_amplitude'] = fit['amplitude']
+    ops['drift_shape_weights'] = fit['weights']
+    ops['drift_shape_basis_mean'] = fit['basis_mean']
+    ops['drift_shape_time_range'] = fit['time_range']
+    ops['drift_shape_time_grid'] = t_grid
+    ops['drift_shape_curves'] = drift_shape_curves(fit, t_grid)
+    ops['drift_shape_model'] = model
+    ops['drift_shape_heldout_improvement'] = improvement
+
+    ops['drift_residual_raw'] = residual
+    ops['drift_residual'] = residual - model[batches]
+    ops['drift_residual_summary'] = residual_summary(
+        ops['drift_residual'], batches, seg_of_batch, n_seg
+        )
+
+    used = ops.get('drift_segment_used', np.arange(n_seg))
+    ranges = []
+    for s in range(n_seg):
+        m = model[seg_of_batch == s]
+        ranges.append(f'{used[s]}: {np.max(m.max(0) - m.min(0)):.1f}')
+    logger.info(f'Learned within-segment drift shape: rank {rank}, {n_basis} '
+                'Gaussian bumps spanning each segment '
+                f'({fit["n_iter"]} iterations).')
+    logger.info('Within-segment drift range per segment (um, worst block): '
+                + ', '.join(ranges))
+    if np.isfinite(improvement):
+        logger.info(f'Held-out batches: mean |residual| {100*improvement:+.0f}% '
+                    'lower than with a constant per segment.')
+        if improvement <= 0:
+            warnings.warn(
+                'The learned within-segment drift shape does not reduce the '
+                'residual on held-out batches, so it is most likely fitting '
+                'noise. Consider `drift_shape_rank = 0`.',
+                UserWarning
+                )
+
+    return ops, model
+
+
+def estimate_chronic_drift(ops, st, bfile, device=torch.device('cuda')):
+    """Estimate drift per recording segment, optionally with a learned shape.
+
+    Parameters
+    ----------
+    ops : dict
+        Must contain `drift_segment_starts`. `drift_shape_rank > 0` adds the
+        learned within-segment shape, `drift_segment_diagnostics` controls
+        whether the residual table is logged.
+    st : np.ndarray
+        Spike times array with 6 columns, as returned by `spikedetect.run`.
+    bfile : kilosort.io.BinaryFiltered
+    device : torch.device; default=torch.device('cuda').
+
+    Returns
+    -------
+    imin : np.ndarray
+        Shift of each batch and block in units of depth bins, shape
+        (Nbatches, nblocks_eff).
+    yblk : np.ndarray
+        Block center depths.
+    ops : dict
+
+    """
+    seg_of_batch, straddles, n_seg = segment_batches(ops, bfile)
+    sp_batch = st[:,4].astype('int64')
+    keep = ~straddles[sp_batch]
+    gid = seg_of_batch[sp_batch[keep]]        # already sorted ascending
+
+    # all spikes of a segment are pooled into a single fingerprint
+    F, ysamp = bin_spikes(ops, st[keep], group_id=gid, n_groups=n_seg)
+
+    # Never smooth the dot products across segment boundaries: a
+    # segment-to-segment step is real signal, not noise. The axis order is
+    # (correlation, time, block).
+    smoothing = list(ops['drift_smoothing'])
+    smoothing[1] = 0.0
+
+    imin_seg, yblk, _, _ = align_block2(
+        F, ysamp, ops, device=device, drift_smoothing=smoothing
+        )
+
+    # Broadcast the per-segment shift back to every batch. `dshift` keeps its
+    # original (Nbatches, nblocks_eff) shape, so nothing downstream needs to
+    # know that chronic mode was used.
+    imin = imin_seg[seg_of_batch]
+    ops['batch_to_segment'] = seg_of_batch
+    ops['drift_segment_shift'] = imin_seg * ops['binning_depth']
+    ops['drift_segment_fingerprints'] = F
+
+    rank = int(ops.get('drift_shape_rank', 0) or 0)
+    diagnostics = ops.get('drift_segment_diagnostics', True)
+    if diagnostics or rank > 0:
+        ops = segment_residual_drift(ops, st, seg_of_batch, straddles, F, ysamp,
+                                     device=device, log=False)
+
+    if rank > 0:
+        if 'drift_residual' in ops:
+            ops, model = apply_drift_shape(ops, seg_of_batch, n_seg)
+            imin = imin + model / ops['binning_depth']
+        else:
+            warnings.warn('No batches were available to fit the learned '
+                          'within-segment drift shape, so it was skipped.',
+                          UserWarning)
+
+    if diagnostics and 'drift_residual_summary' in ops:
+        _log_residual_summary(ops, ops['drift_residual_summary'], seg_of_batch,
+                              straddles)
+
+    return imin, yblk, ops
+
+
+def drift_row_ids(dshift, n_chan, max_bytes=256e6):
+    """Label identical rows of `dshift`, for caching drift matrices.
+
+    Returns None if caching one `Nchan x Nchan` float32 matrix per distinct row
+    would exceed `max_bytes`, which is the case whenever drift varies within
+    segments.
+
+    """
+    rows, ids = np.unique(dshift, axis=0, return_inverse=True)
+    max_entries = max(1, int(max_bytes // (4 * n_chan**2)))
+    if rows.shape[0] > max_entries:
+        return None
+    return ids.reshape(-1).astype('int64')
 
 
 def kernelD(x, y, sig = 1):
@@ -530,6 +1057,7 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     if ops['nblocks']<1:
         ops['dshift'] = None
         ops['batch_to_segment'] = None
+        ops['drift_row_id'] = None
         logger.info('nblocks = 0, skipping drift correction')
         return ops, None
 
@@ -550,40 +1078,21 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
         imin, yblk, _, _ = align_block2(F, ysamp, ops, device=device)
         ops['batch_to_segment'] = None
     else:
-        # --- chronic mode: one shift per (segment, block) ---
-        seg_of_batch, straddles, n_seg = segment_batches(ops, bfile)
-        sp_batch = st[:,4].astype('int64')
-        keep = ~straddles[sp_batch]
-        gid = seg_of_batch[sp_batch[keep]]        # already sorted ascending
-
-        # all spikes of a segment are pooled into a single fingerprint
-        F, ysamp = bin_spikes(ops, st[keep], group_id=gid, n_groups=n_seg)
-
-        # Never smooth the dot products across segment boundaries: a
-        # segment-to-segment step is real signal, not noise. The axis order is
-        # (correlation, time, block).
-        smoothing = list(ops['drift_smoothing'])
-        smoothing[1] = 0.0
-
-        imin_seg, yblk, _, _ = align_block2(
-            F, ysamp, ops, device=device, drift_smoothing=smoothing
-            )
-
-        # Broadcast the per-segment shift back to every batch. `dshift` keeps
-        # its original (Nbatches, nblocks_eff) shape, so nothing downstream
-        # needs to know that chronic mode was used.
-        imin = imin_seg[seg_of_batch]
-        ops['batch_to_segment'] = seg_of_batch
-        ops['drift_segment_shift'] = imin_seg * ops['binning_depth']
-        ops['drift_segment_fingerprints'] = F
-
-        if ops.get('drift_segment_diagnostics', True):
-            ops = segment_residual_drift(ops, st, seg_of_batch, straddles, F,
-                                         ysamp, device=device)
+        # --- chronic mode: one shift per (segment, block), optionally plus a
+        # learned within-segment shape ---
+        imin, yblk, ops = estimate_chronic_drift(ops, st, bfile, device=device)
 
     # imin contains the shifts for each batch, in units of discrete bins
     # multiply back with binning_depth for microns
     dshift = imin * ops['binning_depth']
+
+    # Batches with identical shifts can share one drift matrix (see
+    # `io.BinaryFiltered._drift_whiten`). Per-batch drift is never cached, so
+    # memory use is unchanged when chronic mode is off.
+    if segment_starts is None:
+        ops['drift_row_id'] = None
+    else:
+        ops['drift_row_id'] = drift_row_ids(dshift, len(ops['xc']))
 
     # we save the variables needed for drift correction during the data preprocessing step
     ops['yblk'] = yblk
