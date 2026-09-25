@@ -161,38 +161,42 @@ handled, you can model it instead of splitting days into shorter segments. Each 
 offset plus a smooth curve over the course of the segment:
 
 ~~~
-shift(batch, block) = offset(segment, block) + Σ_k amount_k(segment, block) · shape_k(position in segment)
+shift(batch, block) = offset(segment, block) + Σ_k amount_k(segment, block) · shape_k,segment(position in segment)
 ~~~
 
-The shapes are **learned from the data and shared by all segments**. Each segment only gets its own
-*amount* of each shape, which keeps the model low-rank and well-determined. Each shape is a weighted sum
-of `drift_shape_nbasis` Gaussian bumps spanning each segment from its first batch (0) to its last (1),
-so the curves are smooth by construction, and segments of different lengths are stretched to match.
+Each segment **learns its own shapes from the data**, so every day can follow its own course. Within a
+segment the shapes are **shared by all depth blocks**, and each block gets its own *amount* of each
+shape, which changes from segment to segment just like the offset. That keeps the model low-rank across
+depth, so each day's curve is estimated from all blocks together. Each shape is a weighted sum of
+`drift_shape_nbasis` Gaussian bumps spanning the segment from its first batch (0) to its last (1), so the
+curves are smooth by construction.
 
 ~~~python
 settings = {
     ...
     'drift_segment_starts': 'D:/data/segments.txt',
-    'drift_shape_rank': 1,      # number of shared shapes; 0 (default) = constant per segment
+    'drift_shape_rank': 1,      # shapes per segment; 0 (default) = constant per segment
     'drift_shape_nbasis': 8,    # Gaussian bumps per shape; fewer = smoother
 }
 ~~~
 
 In the GUI both settings are in **Extra settings**, under *preprocessing*.
 
-* `drift_shape_rank = 1` suits drift that follows the same course every day by different amounts.
-  Raise it if days follow genuinely different courses. `drift_shape_rank = drift_shape_nbasis` fits
-  every segment independently, with nothing shared.
+* `drift_shape_rank = 1` suits a probe that moves as a whole within a day, by different amounts at
+  different depths. Raise it if different depths follow genuinely different courses within a day. It
+  can be at most the number of blocks, `2*nblocks - 1`, where every block of every segment is fit
+  independently. With `nblocks = 1` there is a single block, so rank 1 is already independent.
 * The fit uses the per-batch residuals from the diagnostic pass (at most 2000 batches per segment),
-  with robust weighting against outlier batches. On CPU it adds about 5 s for 20 daily segments with
-  `nblocks = 5` at rank 1 (roughly linear in segments and in rank), and memory still scales with the
-  number of segments rather than batches.
+  with robust weighting against outlier batches. Each segment is fit separately, so on CPU it adds
+  about 3 s for 20 daily segments with `nblocks = 5` at rank 1 (twice that with the held-out check;
+  linear in segments), and memory still scales with the number of segments rather than batches.
 * The log reports each segment's within-segment drift range, and how much the model reduces the
   residual on **held-out batches** compared with a constant per segment. If it doesn't reduce it, you get
   a warning that the shape is probably fitting noise.
 * The residual table and the middle panel of `drift_segments.png` then show the residual *after* the
-  model, and a bottom panel shows the learned shapes. The fit is stored in `ops['drift_shape_curves']`,
-  `ops['drift_shape_amplitude']` (µm per unit-RMS shape), `ops['drift_shape_intercept']`, and
+  model, and a bottom panel shows each segment's learned shapes. The fit is stored in
+  `ops['drift_shape_curves']` (segments × time × rank), `ops['drift_shape_amplitude']` (segments ×
+  blocks × rank, µm per unit-RMS shape), `ops['drift_shape_intercept']`, and
   `ops['drift_shape_model']` (the within-segment part of `dshift`).
 
 Because drift now varies within a segment, the per-segment drift-matrix cache is switched off in this

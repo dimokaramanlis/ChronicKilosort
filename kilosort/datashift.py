@@ -665,18 +665,21 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
     The model for row `n` (a batch in segment `s`) and depth block `j` is
 
         residual[n, j] = intercept[s, j]
-                         + sum_k amplitude[s, j, k] * g_k(t[n])
+                         + sum_k amplitude[s, j, k] * g_{s,k}(t[n])
 
-    where the shapes `g_k` are shared by all segments and blocks, and are
-    weighted sums of Gaussian bumps across time, `g_k = sum_m weights[k, m] *
-    phi_m`. The basis is mean-subtracted over the time range, so that a
-    constant cannot hide in a shape; per-segment levels go in `intercept`.
+    where each segment has its own shapes `g_{s,k}`, shared by all depth
+    blocks of that segment. So every segment can follow its own course, while
+    the blocks of a segment move together, each by its own amount. The shapes
+    are weighted sums of Gaussian bumps across time, `g_{s,k} = sum_m
+    weights[s, k, m] * phi_m`. The basis is mean-subtracted over the time
+    range, so that a constant cannot hide in a shape; per-segment levels go in
+    `intercept`.
 
-    Fitting alternates between per-segment weighted least squares for
-    (intercept, amplitude) given the shapes, and a single weighted least
-    squares for the shape weights given the amplitudes, with Huber weights
+    Segments are fit independently. Within a segment, fitting alternates
+    between weighted least squares for (intercept, amplitude) given the
+    shapes, and for the shape weights given the amplitudes, with Huber weights
     updated in between. It is initialized with the leading singular vectors of
-    unconstrained per-segment bump fits.
+    unconstrained per-block bump fits.
 
     Parameters
     ----------
@@ -689,13 +692,14 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
         position within the segment (0 to 1), so that the bumps span each
         segment separately.
     n_seg : int
-        Number of segments. Segments without rows get zero intercept and
-        amplitude.
+        Number of segments. Segments without rows get zero intercept,
+        amplitude and shape weights.
     time_range : tuple of float
         Time range covered by the basis. Should include every time the model
         will be evaluated at.
     rank : int; default=1.
-        Number of shared shapes.
+        Number of shapes per segment. `rank = J` lets every block of a
+        segment follow its own course.
     n_basis : int; default=8.
         Number of Gaussian bumps per shape.
     resolution : float; default=0.5.
@@ -710,8 +714,8 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
     -------
     fit : dict
         'intercept' (n_seg, J), 'amplitude' (n_seg, J, rank) in microns per
-        unit-RMS shape, 'weights' (rank, n_basis), 'basis_mean' (n_basis,),
-        'time_range' (2,), 'n_iter'.
+        unit-RMS shape, 'weights' (n_seg, rank, n_basis), 'basis_mean'
+        (n_basis,), 'time_range' (2,), 'n_iter' (n_seg,).
 
     """
     residual = np.asarray(residual, dtype='float64')
@@ -722,10 +726,10 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
     K, M = int(rank), int(n_basis)
     if M < 2:
         raise ValueError(f'`n_basis` must be at least 2, got {M}.')
-    if K < 1 or K > min(M, n_seg*J):
+    if K < 1 or K > min(M, J):
         raise ValueError(
-            f'`rank` must be between 1 and min(n_basis, n_segments * n_blocks) '
-            f'= {min(M, n_seg*J)}, got {K}.'
+            f'`rank` must be between 1 and min(n_basis, n_blocks) '
+            f'= {min(M, J)}, got {K}.'
             )
 
     time_range = (float(time_range[0]), float(time_range[1]))
@@ -734,51 +738,65 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
     basis_mean = phi_grid.mean(0)
     phi_grid = phi_grid - basis_mean
     phi = gaussian_time_basis(t, time_range, M) - basis_mean
-    rows = [np.flatnonzero(seg == s) for s in range(n_seg)]
-    ones = np.ones((N, 1))
-    w = np.ones((N, J))
 
-    # Initialize with the dominant shapes of unconstrained per-segment fits.
-    X = np.concatenate([ones, phi], 1)
-    B = np.zeros((n_seg, J, M))
-    for s, idx in enumerate(rows):
-        if idx.size > 0:
-            B[s] = _weighted_ridge(X[idx], w[idx], residual[idx], ridge)[:,1:]
-    _, _, Vt = np.linalg.svd(B.reshape(n_seg*J, M), full_matrices=False)
+    intercept = np.zeros((n_seg, J))
+    amplitude = np.zeros((n_seg, J, K))
+    W = np.zeros((n_seg, K, M))
+    n_iter = np.zeros(n_seg, dtype='int64')
+    for s in range(n_seg):
+        idx = np.flatnonzero(seg == s)
+        if idx.size == 0:
+            continue
+        intercept[s], amplitude[s], W[s], n_iter[s] = _fit_segment_shape(
+            residual[idx], phi[idx], phi_grid, K, resolution, max_iter, tol,
+            ridge
+            )
+
+    return {
+        'intercept': intercept, 'amplitude': amplitude, 'weights': W,
+        'basis_mean': basis_mean, 'time_range': np.array(time_range),
+        'n_iter': n_iter,
+        }
+
+
+def _fit_segment_shape(Y, P, phi_grid, K, resolution, max_iter, tol, ridge):
+    """Fit `K` shapes shared by the blocks of one segment, see `fit_drift_shape`.
+
+    Y is the residual (n, J), P the mean-subtracted basis at each row (n, M).
+    Returns intercept (J,), amplitude (J, K), weights (K, M) and the number of
+    iterations.
+
+    """
+    n, J = Y.shape
+    M = P.shape[1]
+    ones = np.ones((n, 1))
+    w = np.ones((n, J))
+
+    # Initialize with the dominant shapes of unconstrained per-block fits.
+    B = _weighted_ridge(np.concatenate([ones, P], 1), w, Y, ridge)[:,1:]
+    _, _, Vt = np.linalg.svd(B, full_matrices=False)
     W = _normalize_shapes(Vt[:K], phi_grid)
 
-    def segment_step(W, w):
-        G = phi @ W.T
-        X = np.concatenate([ones, G], 1)
-        coef = np.zeros((n_seg, J, 1+K))
-        for s, idx in enumerate(rows):
-            if idx.size > 0:
-                coef[s] = _weighted_ridge(X[idx], w[idx], residual[idx], ridge)
-        return G, coef[...,0], coef[...,1:]
+    def block_step(W, w):
+        G = P @ W.T
+        coef = _weighted_ridge(np.concatenate([ones, G], 1), w, Y, ridge)
+        return G, coef[:,0], coef[:,1:]
 
     n_iter = 0
     for n_iter in range(1, max_iter+1):
         # intercepts and amplitudes, given the shapes
-        G, intercept, amplitude = segment_step(W, w)
-        err = residual - intercept[seg] - np.einsum('njk,nk->nj', amplitude[seg], G)
+        G, intercept, amplitude = block_step(W, w)
+        err = Y - intercept - G @ amplitude.T
         w = _huber_weights(err, resolution)
 
         # Shape weights, given intercepts and amplitudes. The design row for
-        # (n, j) is kron(amplitude[s, j], phi[n]); accumulate normal equations
-        # per segment to avoid materializing it.
-        XtX = np.zeros((K*M, K*M))
-        Xty = np.zeros(K*M)
-        for s, idx in enumerate(rows):
-            if idx.size == 0:
-                continue
-            P = phi[idx]
-            ws = w[idx]
-            ys = residual[idx] - intercept[s]
-            PtWP = np.einsum('nm,nj,np->jmp', P, ws, P)
-            PtWy = np.einsum('nm,nj->jm', P, ws*ys)
-            a = amplitude[s]
-            XtX += np.einsum('jk,jl,jmp->kmlp', a, a, PtWP).reshape(K*M, K*M)
-            Xty += np.einsum('jk,jm->km', a, PtWy).reshape(K*M)
+        # (n, j) is kron(amplitude[j], P[n]).
+        ys = Y - intercept
+        PtWP = np.einsum('nm,nj,np->jmp', P, w, P)
+        PtWy = np.einsum('nm,nj->jm', P, w*ys)
+        XtX = np.einsum('jk,jl,jmp->kmlp', amplitude, amplitude,
+                        PtWP).reshape(K*M, K*M)
+        Xty = np.einsum('jk,jm->km', amplitude, PtWy).reshape(K*M)
         lam = ridge*np.trace(XtX)/(K*M) + 1e-12
         W_new = np.linalg.solve(XtX + lam*np.eye(K*M), Xty).reshape(K, M)
         W_new = _normalize_shapes(W_new, phi_grid, fallback=W)
@@ -788,31 +806,31 @@ def fit_drift_shape(residual, seg, t, n_seg, time_range, rank=1, n_basis=8,
         if change < tol:
             break
 
-    G, intercept, amplitude = segment_step(W, w)
+    G, intercept, amplitude = block_step(W, w)
 
     # Order shapes by how much drift they account for.
-    order = np.argsort(-np.sum(amplitude**2, axis=(0,1)))
-    W = W[order]
-    amplitude = amplitude[..., order]
+    order = np.argsort(-np.sum(amplitude**2, axis=0))
 
-    return {
-        'intercept': intercept, 'amplitude': amplitude, 'weights': W,
-        'basis_mean': basis_mean, 'time_range': np.array(time_range),
-        'n_iter': n_iter,
-        }
+    return intercept, amplitude[:,order], W[order], n_iter
 
 
 def drift_shape_curves(fit, t):
-    """Evaluate the learned shapes at times `t`. Returns (len(t), rank)."""
+    """Evaluate each segment's shapes at times `t`.
+
+    Returns (n_seg, len(t), rank).
+
+    """
     W = fit['weights']
-    phi = gaussian_time_basis(t, fit['time_range'], W.shape[1]) - fit['basis_mean']
-    return phi @ W.T
+    phi = gaussian_time_basis(t, fit['time_range'], W.shape[-1]) - fit['basis_mean']
+    return np.einsum('nm,skm->snk', phi, W)
 
 
 def drift_shape_model(fit, seg, t):
     """Within-segment drift predicted by `fit`, in microns. Returns (len(t), J)."""
-    G = drift_shape_curves(fit, t)
     seg = np.asarray(seg, dtype='int64')
+    W = fit['weights']
+    phi = gaussian_time_basis(t, fit['time_range'], W.shape[-1]) - fit['basis_mean']
+    G = np.einsum('nm,nkm->nk', phi, W[seg])
     return fit['intercept'][seg] + np.einsum('njk,nk->nj', fit['amplitude'][seg], G)
 
 
@@ -847,7 +865,7 @@ def segment_phase(t, seg_of_batch, n_seg):
 
 
 def apply_drift_shape(ops, seg_of_batch, n_seg):
-    """Fit the learned within-segment shape and evaluate it for every batch.
+    """Fit the learned within-segment shapes and evaluate them for every batch.
 
     Uses the per-batch residuals from `segment_residual_drift`. Those are
     measured against each segment's own pooled fingerprint in the same roll
@@ -927,9 +945,9 @@ def apply_drift_shape(ops, seg_of_batch, n_seg):
     for s in range(n_seg):
         m = model[seg_of_batch == s]
         ranges.append(f'{used[s]}: {np.max(m.max(0) - m.min(0)):.1f}')
-    logger.info(f'Learned within-segment drift shape: rank {rank}, {n_basis} '
-                'Gaussian bumps spanning each segment '
-                f'({fit["n_iter"]} iterations).')
+    logger.info(f'Learned within-segment drift shapes: rank {rank} per '
+                f'segment, {n_basis} Gaussian bumps spanning each segment '
+                f'(at most {fit["n_iter"].max()} iterations).')
     logger.info('Within-segment drift range per segment (um, worst block): '
                 + ', '.join(ranges))
     if np.isfinite(improvement):

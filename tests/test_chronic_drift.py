@@ -388,9 +388,8 @@ class TestSegmentResidualDrift:
 def _synthetic_shape_residuals(shapes, rows_per_seg, J=3, noise=0.5, seed=0):
     """Residuals `intercept + amplitude * shape(phase) + noise`, quantized.
 
-    `shapes` is a list of callables on [0, 1], one per segment (repeat the same
-    one for a shared shape). Returns residual, seg, phase, and the noise-free
-    values.
+    `shapes` is a list of callables on [0, 1], one per segment, shared by the
+    segment's blocks. Returns residual, seg, phase, and the noise-free values.
 
     """
     rng = np.random.default_rng(seed)
@@ -413,6 +412,7 @@ def _synthetic_shape_residuals(shapes, rows_per_seg, J=3, noise=0.5, seed=0):
 
 class TestDriftShape:
     settle = staticmethod(lambda p: 1 - np.exp(-p/0.3))
+    hump = staticmethod(lambda p: np.exp(-(p - 0.5)**2 / (2*0.15**2)))
 
     def test_gaussian_basis(self):
         t = np.linspace(0, 1, 8)
@@ -428,23 +428,29 @@ class TestDriftShape:
         phase = datashift.segment_phase(t, seg, 3)
         assert np.allclose(phase, [0, 0.5, 1, 0, 1, 0.5])
 
-    def test_recovers_shared_shape(self):
-        # Segments of different lengths share one shape, in different amounts.
+    def test_recovers_each_segment_shape(self):
+        # Segments of different lengths each follow their own course, shared
+        # by their blocks in different amounts.
+        shapes = [self.settle, self.hump, lambda p: -p, self.settle,
+                  lambda p: np.sin(2*np.pi*p), self.hump]
         res, seg, phase, clean = _synthetic_shape_residuals(
-            [self.settle]*6, rows_per_seg=[200, 400, 250, 300, 350, 150]
+            shapes, rows_per_seg=[200, 400, 250, 300, 350, 150]
             )
         fit = datashift.fit_drift_shape(res, seg, phase, 6, (0, 1), rank=1,
                                         n_basis=8, resolution=0.5)
+        assert fit['weights'].shape == (6, 1, 8)
 
         grid = np.linspace(0, 1, 200)
-        learned = datashift.drift_shape_curves(fit, grid)[:,0]
-        true = self.settle(grid)
-        assert np.abs(np.corrcoef(learned, true)[0,1]) > 0.99
+        learned = datashift.drift_shape_curves(fit, grid)
+        assert learned.shape == (6, 200, 1)
+        for s, shape in enumerate(shapes):
+            g = learned[s,:,0]
+            assert np.abs(np.corrcoef(g, shape(grid))[0,1]) > 0.99
+            # shapes are normalized to unit RMS over the range
+            assert np.isclose(np.sqrt(np.mean((g - g.mean())**2)), 1,
+                              atol=0.05)
         pred = datashift.drift_shape_model(fit, seg, phase)
         assert np.sqrt(np.mean((pred - clean)**2)) < 0.5
-        # shapes are normalized to unit RMS over the range
-        assert np.isclose(np.sqrt(np.mean(
-            (learned - learned.mean())**2)), 1, atol=0.05)
 
     def test_robust_to_outlier_batches(self):
         res, seg, phase, clean = _synthetic_shape_residuals(
@@ -459,18 +465,24 @@ class TestDriftShape:
         pred = datashift.drift_shape_model(fit, seg, phase)
         assert np.sqrt(np.mean((pred - clean)[~bad]**2)) < 0.8
 
-    def test_full_rank_fits_segments_independently(self):
-        # With rank == n_basis nothing is shared, so segments following
-        # different courses are all captured.
-        hump = lambda p: np.exp(-(p - 0.5)**2 / (2*0.15**2))
-        shapes = [self.settle, hump, lambda p: -p, self.settle]
-        res, seg, phase, clean = _synthetic_shape_residuals(
-            shapes, rows_per_seg=[300]*4, seed=3
-            )
+    def test_full_rank_fits_blocks_independently(self):
+        # With rank == number of blocks nothing is shared between the blocks
+        # of a segment, so blocks following different courses are captured.
+        rng = np.random.default_rng(3)
+        shapes = [self.settle, self.hump, lambda p: -p]
+        n = 300
+        p = np.linspace(0, 1, n)
+        clean = np.concatenate([
+            np.stack([a*f(p) for a, f in zip(rng.uniform(4, 10, 3),
+                                             np.roll(shapes, s))], 1)
+            for s in range(2)])
+        res = np.round((clean + rng.normal(0, 0.5, clean.shape))/0.5)*0.5
+        seg = np.repeat([0, 1], n)
+        phase = np.tile(p, 2)
 
-        full = datashift.fit_drift_shape(res, seg, phase, 4, (0, 1), rank=8,
+        full = datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=3,
                                          n_basis=8, resolution=0.5)
-        shared = datashift.fit_drift_shape(res, seg, phase, 4, (0, 1), rank=1,
+        shared = datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=1,
                                            n_basis=8, resolution=0.5)
         err_full = np.sqrt(np.mean(
             (datashift.drift_shape_model(full, seg, phase) - clean)**2))
@@ -488,6 +500,10 @@ class TestDriftShape:
                                         n_basis=8)
         assert np.all(fit['intercept'][1] == 0)
         assert np.all(fit['amplitude'][1] == 0)
+        assert np.all(fit['weights'][1] == 0)
+        pred = datashift.drift_shape_model(fit, np.array([1, 1]),
+                                           np.array([0.2, 0.8]))
+        assert np.all(pred == 0)
 
     def test_rank_validation(self):
         res, seg, phase, _ = _synthetic_shape_residuals(
@@ -497,8 +513,8 @@ class TestDriftShape:
             datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=9,
                                       n_basis=8)
         with pytest.raises(ValueError):
-            # only 2 segment-block series to share 3 shapes across
-            datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=3,
+            # a single block cannot determine 2 shapes per segment
+            datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=2,
                                       n_basis=8)
         with pytest.raises(ValueError):
             datashift.fit_drift_shape(res, seg, phase, 2, (0, 1), rank=0,
@@ -540,7 +556,7 @@ class TestDriftShape:
         assert err1 < 0.5*err0
         assert err1 < 2.0
 
-        assert ops1['drift_shape_curves'].shape == (200, 1)
+        assert ops1['drift_shape_curves'].shape == (n_seg, 200, 1)
         assert ops1['drift_shape_amplitude'].shape == (n_seg, 1, 1)
         assert ops1['drift_residual_raw'].shape == ops1['drift_residual'].shape
         # dshift is no longer constant within segments
@@ -612,7 +628,16 @@ class TestInitializeOps:
     def test_shape_rank_exceeding_nbasis_raises(self):
         with pytest.raises(ValueError):
             self._init(drift_segment_starts=[0, 1000], drift_shape_rank=9,
-                       drift_shape_nbasis=8)
+                       drift_shape_nbasis=8, nblocks=10)
+
+    def test_shape_rank_exceeding_blocks_raises(self):
+        with pytest.raises(ValueError):
+            self._init(drift_segment_starts=[0, 1000], drift_shape_rank=2,
+                       nblocks=1)
+        # 2*nblocks - 1 = 3 blocks
+        ops, _ = self._init(drift_segment_starts=[0, 1000],
+                            drift_shape_rank=3, nblocks=2)
+        assert ops['drift_shape_rank'] == 3
 
     def test_negative_rank_raises(self):
         with pytest.raises(ValueError):
@@ -657,7 +682,7 @@ class TestPlots:
             }
         shape = {
             'drift_shape_time_grid': np.linspace(0, 1, 200),
-            'drift_shape_curves': np.random.randn(200, 2),
+            'drift_shape_curves': np.random.randn(3, 200, 2),
             }
         for i, ops in enumerate([base, {**base, **residual},
                                  {**base, **residual, **shape}]):
@@ -782,7 +807,7 @@ class TestEndToEnd:
 
         J = 2*ops['nblocks'] - 1
         assert ops['dshift'].shape == (ops['Nbatches'], J)
-        assert ops['drift_shape_curves'].shape == (200, 1)
+        assert ops['drift_shape_curves'].shape == (3, 200, 1)
         assert ops['drift_shape_amplitude'].shape == (3, J, 1)
         assert ops['drift_shape_model'].shape == ops['dshift'].shape
         # the segment offsets plus the model make up dshift

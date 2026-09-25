@@ -262,16 +262,16 @@ EXTRA_PARAMETERS = {
         'max': np.inf, 'exclude': [], 'default': 0, 'step': 'preprocessing',
         'description':
             """
-            When `drift_segment_starts` is set, number of smooth within-segment
-            drift shapes shared by all segments. Each shape is a curve over the
-            course of a segment (from its first to its last batch, so segments
-            of different lengths are stretched to match). Each segment gets its
-            own offset plus its own amount of each shape, so for example a rank
-            of 1 can capture drift that follows the same course every day but
-            by a different amount. The shapes are learned from the data.
-            Setting this equal to `drift_shape_nbasis` fits every segment
-            independently. 0 (default) holds drift constant within each
-            segment. Has no effect otherwise.
+            When `drift_segment_starts` is set, number of smooth drift shapes
+            learned for each segment. Each segment has its own shapes, shared
+            by all depth blocks of that segment. Each shape is a curve over the
+            course of the segment (from its first to its last batch). Each
+            block gets its own offset plus its own amount of each shape, so a
+            rank of 1 lets every day follow its own course, with the whole
+            probe moving together by different amounts at different depths.
+            Setting this equal to the number of blocks (2*nblocks - 1) lets
+            every block of every segment drift independently. 0 (default)
+            holds drift constant within each segment. Has no effect otherwise.
             """
     },
 

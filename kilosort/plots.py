@@ -78,7 +78,7 @@ def plot_chronic_drift(ops, results_dir, tmin=0):
     the drift estimate, the middle panel the residual per-batch shift within
     each segment (after the learned shape, if one was fit), which is the check
     on the within-segment model. If `drift_shape_rank > 0`, the bottom panel
-    shows the learned shapes over the course of a segment.
+    shows each segment's learned shapes over the course of the segment.
 
     """
     if ops.get('batch_to_segment', None) is None:
@@ -130,18 +130,25 @@ def plot_chronic_drift(ops, results_dir, tmin=0):
     time_axes[-1].set_xlabel('Time (s)')
 
     if has_shape:
+        # curves: (n_segments, n_grid, rank). Color by segment, line style by
+        # shape.
         ax = fig.add_subplot(nrows, 1, nrows)
         grid = ops['drift_shape_time_grid']
-        for k in range(curves.shape[1]):
-            color = COLOR_CODES[k % len(COLOR_CODES)]
-            ax.plot(grid, curves[:,k], c=color, label=f'shape {k}')
+        used = ops['drift_segment_used']
+        styles = ['-', '--', ':', '-.']
+        for s in range(curves.shape[0]):
+            color = COLOR_CODES[s % len(COLOR_CODES)]
+            for k in range(curves.shape[2]):
+                label = f'segment {used[s]}' if k == 0 else None
+                ax.plot(grid, curves[s,:,k], c=color, lw=1,
+                        ls=styles[k % len(styles)], label=label)
         ax.axhline(0, c='gray', lw=0.5)
         ax.set_xlabel('Position within segment (0 = first batch, 1 = last)')
         ax.set_ylabel('Shape (unit RMS)')
-        ax.set_title('Learned within-segment drift shape '
-                     '(amount per segment: ops["drift_shape_amplitude"])')
-        if curves.shape[1] > 1:
-            ax.legend()
+        ax.set_title('Learned within-segment drift shape of each segment '
+                     '(amount per block: ops["drift_shape_amplitude"])')
+        if curves.shape[0] <= 12:
+            ax.legend(fontsize='small', ncol=2)
 
     fig.suptitle('Chronic drift correction')
     fig.tight_layout()

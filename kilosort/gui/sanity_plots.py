@@ -121,11 +121,17 @@ def plot_chronic_drift(plot_window, ops, settings):
             labels={'left': 'Shape (unit RMS)',
                     'bottom': 'Position within segment (0 = first batch, 1 = last)'}
             )
-        p3.setTitle('Learned within-segment drift shape')
+        p3.setTitle('Learned within-segment drift shape of each segment')
         grid = ops['drift_shape_time_grid']
-        for k in range(curves.shape[1]):
-            color = COLOR_CODES[k % len(COLOR_CODES)]
-            p3.plot(grid, curves[:,k], pen=color)
+        # curves: (n_segments, n_grid, rank). Color by segment, line style by
+        # shape.
+        styles = [QtCore.Qt.SolidLine, QtCore.Qt.DashLine, QtCore.Qt.DotLine,
+                  QtCore.Qt.DashDotLine]
+        for s in range(curves.shape[0]):
+            color = COLOR_CODES[s % len(COLOR_CODES)]
+            for k in range(curves.shape[2]):
+                pen = pg.mkPen(color=color, style=styles[k % len(styles)])
+                p3.plot(grid, curves[s,:,k], pen=pen)
         p3.addItem(pg.InfiniteLine(pos=0, angle=0,
                                    pen=pg.mkPen(color=(128, 128, 128))))
 

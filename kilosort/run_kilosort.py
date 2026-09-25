@@ -598,6 +598,14 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
                 f'`drift_shape_rank` ({rank}) cannot exceed '
                 f'`drift_shape_nbasis` ({n_basis}).'
                 )
+        # Each segment's shapes are shared by its depth blocks, so more shapes
+        # than blocks cannot be determined.
+        n_blocks = 2*ops['nblocks'] - 1
+        if seg is not None and ops['nblocks'] > 0 and rank > n_blocks:
+            raise ValueError(
+                f'`drift_shape_rank` ({rank}) cannot exceed the number of '
+                f'registration blocks, 2*nblocks - 1 = {n_blocks}.'
+                )
 
     return ops, settings
 
