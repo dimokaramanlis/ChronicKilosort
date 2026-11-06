@@ -41,6 +41,27 @@ def segment_boundary_times(ops, tmin=0):
     return ibatch*(NT/fs) + tmin
 
 
+def _block_colors(ops, n_blocks):
+    """One color per non-rigid block, ordered by depth, plus depth labels.
+
+    Neighbouring blocks get neighbouring colors from a sequential colormap
+    (truncated so the darkest end stays visible on the dark background).
+
+    """
+    colors = matplotlib.colormaps['plasma'](np.linspace(0.25, 1, n_blocks))
+    yblk = ops.get('yblk', None)
+    if yblk is None or len(yblk) != n_blocks:
+        labels = [f'block {i}' for i in range(n_blocks)]
+    else:
+        labels = [f'{y:.0f} um' for y in yblk]
+    return colors, labels
+
+
+def _block_legend(ax, n_blocks):
+    ax.legend(title='Block depth', fontsize='x-small', title_fontsize='small',
+              ncol=int(np.ceil(n_blocks / 10)), loc='upper left')
+
+
 def plot_drift_amount(ops, results_dir, tmin=0):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(8,8))
@@ -50,9 +71,10 @@ def plot_drift_amount(ops, results_dir, tmin=0):
     fs = settings['fs']
     NT = settings['batch_size']
     t = np.arange(dshift.shape[0])*(NT/fs) + tmin
+    colors, labels = _block_colors(ops, dshift.shape[1])
     for i in range(dshift.shape[1]):
-        color = COLOR_CODES[i % len(COLOR_CODES)]
-        ax.plot(t, dshift[:,i], c=color)
+        ax.plot(t, dshift[:,i], c=colors[i], label=labels[i])
+    _block_legend(ax, dshift.shape[1])
 
     boundaries = segment_boundary_times(ops, tmin=tmin)
     if boundaries is not None:
@@ -101,9 +123,11 @@ def plot_chronic_drift(ops, results_dir, tmin=0):
 
     ax = fig.add_subplot(nrows, 1, 1)
     time_axes = [ax]
+    colors, labels = _block_colors(ops, dshift.shape[1])
     for i in range(dshift.shape[1]):
-        color = COLOR_CODES[i % len(COLOR_CODES)]
-        ax.step(t, dshift[:,i], where='post', c=color, lw=1)
+        ax.step(t, dshift[:,i], where='post', c=colors[i], lw=1,
+                label=labels[i])
+    _block_legend(ax, dshift.shape[1])
     ax.set_ylabel('Depth shift (um)')
     title = 'Drift per segment' + (' with learned shape' if has_shape else '')
     ax.set_title(f'{title} ({ops["drift_segment_used"].size} segments, '
@@ -114,9 +138,9 @@ def plot_chronic_drift(ops, results_dir, tmin=0):
         time_axes.append(ax)
         tr = ops['drift_residual_batches']*(NT/fs) + tmin
         ax.axhspan(-dd, dd, color='gray', alpha=0.3, zorder=0)
+        res_colors, _ = _block_colors(ops, residual.shape[1])
         for i in range(residual.shape[1]):
-            color = COLOR_CODES[i % len(COLOR_CODES)]
-            ax.plot(tr, residual[:,i], c=color, lw=0.5, alpha=0.8)
+            ax.plot(tr, residual[:,i], c=res_colors[i], lw=0.5, alpha=0.8)
         ax.set_ylabel('Residual shift (um)')
         after = ' after learned shape' if has_shape else ''
         ax.set_title(f'Within-segment residual drift{after} '
