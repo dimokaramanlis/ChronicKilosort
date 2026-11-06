@@ -293,10 +293,16 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             if gui_sorter is not None:
                 gui_sorter.dshift = ops['dshift']
                 gui_sorter.st0 = st0
+                gui_sorter.ops = ops
                 gui_sorter.plotDataReady.emit('drift')
             else:
                 kplots.plot_drift_amount(ops, results_dir, tmin=settings['tmin'])
                 kplots.plot_drift_scatter(st0, results_dir, tmin=settings['tmin'])
+                kplots.plot_drift_scatter_corrected(st0, ops, results_dir,
+                                                    tmin=settings['tmin'])
+                if ops.get('batch_to_segment', None) is not None:
+                    kplots.plot_chronic_drift(ops, results_dir,
+                                              tmin=settings['tmin'])
 
         # Sort spikes and save results
         st,tF, Wall0, clu0 = detect_spikes(
@@ -549,6 +555,57 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
                          '(templates_from_data=False), nt must be 61')
 
     ops = {**ops, **probe}
+
+    # Parse the chronic drift segments here rather than in `datashift.run`, so
+    # that a bad path or a malformed file fails in the first second of the run
+    # instead of after preprocessing.
+    seg = settings.get('drift_segment_starts', None)
+    if seg is not None:
+        # The parsed array lives on `ops` only; `ops['settings']` keeps the
+        # original path/list so that saved settings stay serializable and
+        # comparable to the defaults.
+        ops['drift_segment_starts'] = io.load_drift_segments(seg)
+        if ops['nblocks'] < 1:
+            warnings.warn(
+                '`drift_segment_starts` was given but `nblocks=0`, so drift '
+                'correction is disabled and the segments will be ignored.',
+                UserWarning
+                )
+        logger.info(f'Chronic drift mode: {ops["drift_segment_starts"].size} '
+                    'segments requested.')
+    else:
+        ops['drift_segment_starts'] = None
+
+    rank = settings.get('drift_shape_rank', 0)
+    rank = 0 if rank is None else int(rank)
+    n_basis = int(settings.get('drift_shape_nbasis', 8))
+    ops['drift_shape_rank'] = rank
+    ops['drift_shape_nbasis'] = n_basis
+    if rank < 0:
+        raise ValueError(f'`drift_shape_rank` must be >= 0, got {rank}.')
+    if rank > 0:
+        if seg is None:
+            warnings.warn(
+                '`drift_shape_rank` > 0 has no effect unless '
+                '`drift_segment_starts` is set.', UserWarning
+                )
+        if n_basis < 2:
+            raise ValueError(
+                f'`drift_shape_nbasis` must be at least 2, got {n_basis}.'
+                )
+        if rank > n_basis:
+            raise ValueError(
+                f'`drift_shape_rank` ({rank}) cannot exceed '
+                f'`drift_shape_nbasis` ({n_basis}).'
+                )
+        # Each segment's shapes are shared by its depth blocks, so more shapes
+        # than blocks cannot be determined.
+        n_blocks = 2*ops['nblocks'] - 1
+        if seg is not None and ops['nblocks'] > 0 and rank > n_blocks:
+            raise ValueError(
+                f'`drift_shape_rank` ({rank}) cannot exceed the number of '
+                f'registration blocks, 2*nblocks - 1 = {n_blocks}.'
+                )
 
     return ops, settings
 

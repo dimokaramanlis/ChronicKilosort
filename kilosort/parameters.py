@@ -222,6 +222,71 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'drift_segment_starts': {
+        'gui_name': 'drift segment starts', 'type': str, 'min': None,
+        'max': None, 'exclude': [], 'default': None, 'step': 'preprocessing',
+        'description':
+            """
+            Path to a text file listing the start sample of each recording
+            segment (for example one per day of a concatenated chronic
+            recording), separated by whitespace, newlines, or commas. Sample
+            indices are relative to the start of the data and are independent
+            of `tmin`/`tmax`. If the first value is not 0, a 0 is prepended.
+
+            When set, drift is estimated once per segment instead of once per
+            batch: the vertical shift is held constant within each segment,
+            while remaining non-rigid across depth according to `nblocks`. This
+            is intended for chronic recordings in which day-to-day shifts
+            dominate and within-day drift is negligible. Leave as None for
+            standard per-batch drift correction.
+
+            When running through the API, a list of integers may be given
+            instead of a file path.
+            """
+    },
+
+    'drift_segment_diagnostics': {
+        'gui_name': 'drift segment diagnostics', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'preprocessing',
+        'description':
+            """
+            When `drift_segment_starts` is set, also estimate the residual
+            per-batch shift within each segment and report it. This checks the
+            assumption that drift is constant within a segment. Has no effect
+            otherwise.
+            """
+    },
+
+    'drift_shape_rank': {
+        'gui_name': 'drift shape rank', 'type': int, 'min': 0,
+        'max': np.inf, 'exclude': [], 'default': 0, 'step': 'preprocessing',
+        'description':
+            """
+            When `drift_segment_starts` is set, number of smooth drift shapes
+            learned for each segment. Each segment has its own shapes, shared
+            by all depth blocks of that segment. Each shape is a curve over the
+            course of the segment (from its first to its last batch). Each
+            block gets its own offset plus its own amount of each shape, so a
+            rank of 1 lets every day follow its own course, with the whole
+            probe moving together by different amounts at different depths.
+            Setting this equal to the number of blocks (2*nblocks - 1) lets
+            every block of every segment drift independently. 0 (default)
+            holds drift constant within each segment. Has no effect otherwise.
+            """
+    },
+
+    'drift_shape_nbasis': {
+        'gui_name': 'drift shape nbasis', 'type': int, 'min': 2,
+        'max': np.inf, 'exclude': [], 'default': 8, 'step': 'preprocessing',
+        'description':
+            """
+            Number of Gaussian bumps, evenly spaced across each segment, used
+            to build each learned drift shape. Fewer bumps
+            give smoother shapes. Must be at least `drift_shape_rank`. Has no
+            effect unless `drift_shape_rank` > 0.
+            """
+    },
+
 
     ### SPIKE DETECTION
     # NOTE: if left as None, will be set to `int(20 * settings['nt']/61)`

@@ -5,9 +5,11 @@ import pyqtgraph.exporters
 import numpy as np
 import matplotlib
 import torch
-from qtpy import QtWidgets
+from qtpy import QtCore, QtWidgets
 
-from kilosort.plots import COLOR_CODES, PROBE_PLOT_COLORS
+from kilosort.plots import (
+    COLOR_CODES, PROBE_PLOT_COLORS, segment_boundary_times
+    )
 
 
 class PlotWindow(QtWidgets.QWidget):
@@ -31,7 +33,17 @@ class PlotWindow(QtWidgets.QWidget):
 
 # TODO: Axis labels don't actually show up anywhere, still debugging
 
-def plot_drift_amount(plot_window, dshift, settings):
+def _add_segment_boundaries(plot_item, ops, settings):
+    """Draw a dashed line at each segment boundary, for chronic drift mode."""
+    boundaries = segment_boundary_times(ops, tmin=settings['tmin'])
+    if boundaries is None:
+        return
+    pen = pg.mkPen(color=(128, 128, 128), style=QtCore.Qt.DashLine)
+    for b in boundaries:
+        plot_item.addItem(pg.InfiniteLine(pos=b, angle=90, pen=pen))
+
+
+def plot_drift_amount(plot_window, dshift, settings, ops=None):
     # Drift amount for each block of probe over time
     p1 = plot_window.plot_widget.addPlot(
         row=0, col=0, labels={'left': 'Depth shift (um)', 'bottom': 'Time (s)'}
@@ -45,8 +57,86 @@ def plot_drift_amount(plot_window, dshift, settings):
         color = COLOR_CODES[i % len(COLOR_CODES)]
         p1.plot(t, dshift[:,i], pen=color)
 
+    if ops is not None:
+        _add_segment_boundaries(p1, ops, settings)
+
     plot_window.show()
     save_path = str(Path(settings['results_dir']) / 'drift_amount.png')
+    pg.exporters.ImageExporter(plot_window.plot_widget.scene()).export(save_path)
+
+
+def plot_chronic_drift(plot_window, ops, settings):
+    """Per-segment drift and within-segment residual drift, for the GUI.
+
+    Mirrors `kilosort.plots.plot_chronic_drift`. Does nothing if chronic drift
+    correction was not used.
+
+    """
+    if ops.get('batch_to_segment', None) is None:
+        return
+
+    dshift = ops['dshift']
+    fs = settings['fs']
+    NT = settings['batch_size']
+    dd = ops['binning_depth']
+    t = np.arange(dshift.shape[0])*(NT/fs) + settings['tmin']
+    residual = ops.get('drift_residual', None)
+    curves = ops.get('drift_shape_curves', None)
+    has_shape = curves is not None
+
+    p1 = plot_window.plot_widget.addPlot(
+        row=0, col=0, labels={'left': 'Depth shift (um)', 'bottom': 'Time (s)'}
+        )
+    n_seg = ops['drift_segment_used'].size
+    title = 'Drift per segment' + (' with learned shape' if has_shape else '')
+    p1.setTitle(f'{title} ({n_seg} segments, {dshift.shape[1]} blocks)')
+    for i in range(dshift.shape[1]):
+        color = COLOR_CODES[i % len(COLOR_CODES)]
+        # dshift is already piecewise constant, so a plain line shows
+        # the steps without depending on pyqtgraph's stepMode.
+        p1.plot(t, dshift[:,i], pen=color)
+    _add_segment_boundaries(p1, ops, settings)
+
+    if residual is not None:
+        p2 = plot_window.plot_widget.addPlot(
+            row=1, col=0,
+            labels={'left': 'Residual shift (um)', 'bottom': 'Time (s)'}
+            )
+        after = ' after learned shape' if has_shape else ''
+        p2.setTitle(f'Within-segment residual drift{after} '
+                    f'(dashed band: +/- binning_depth = {dd} um)')
+        tr = ops['drift_residual_batches']*(NT/fs) + settings['tmin']
+        for i in range(residual.shape[1]):
+            color = COLOR_CODES[i % len(COLOR_CODES)]
+            p2.plot(tr, residual[:,i], pen=color)
+        band = pg.mkPen(color=(128, 128, 128), style=QtCore.Qt.DashLine)
+        for y in [-dd, dd]:
+            p2.addItem(pg.InfiniteLine(pos=y, angle=0, pen=band))
+        _add_segment_boundaries(p2, ops, settings)
+        p2.setXLink(p1)
+
+    if has_shape:
+        p3 = plot_window.plot_widget.addPlot(
+            row=1 + (residual is not None), col=0,
+            labels={'left': 'Shape (unit RMS)',
+                    'bottom': 'Position within segment (0 = first batch, 1 = last)'}
+            )
+        p3.setTitle('Learned within-segment drift shape of each segment')
+        grid = ops['drift_shape_time_grid']
+        # curves: (n_segments, n_grid, rank). Color by segment, line style by
+        # shape.
+        styles = [QtCore.Qt.SolidLine, QtCore.Qt.DashLine, QtCore.Qt.DotLine,
+                  QtCore.Qt.DashDotLine]
+        for s in range(curves.shape[0]):
+            color = COLOR_CODES[s % len(COLOR_CODES)]
+            for k in range(curves.shape[2]):
+                pen = pg.mkPen(color=color, style=styles[k % len(styles)])
+                p3.plot(grid, curves[s,:,k], pen=pen)
+        p3.addItem(pg.InfiniteLine(pos=0, angle=0,
+                                   pen=pg.mkPen(color=(128, 128, 128))))
+
+    plot_window.show()
+    save_path = str(Path(settings['results_dir']) / 'drift_segments.png')
     pg.exporters.ImageExporter(plot_window.plot_widget.scene()).export(save_path)
 
 
