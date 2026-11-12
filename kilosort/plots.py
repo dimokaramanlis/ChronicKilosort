@@ -160,8 +160,12 @@ def plot_chronic_drift(ops, results_dir, tmin=0):
         grid = ops['drift_shape_time_grid']
         used = ops['drift_segment_used']
         styles = ['-', '--', ':', '-.']
+        # Segments are ordered in time: color them along a sequential map
+        # (truncated so the dark end stays visible on the dark background).
+        seg_colors = matplotlib.colormaps['viridis'](
+            np.linspace(0.2, 1, curves.shape[0]))
         for s in range(curves.shape[0]):
-            color = COLOR_CODES[s % len(COLOR_CODES)]
+            color = seg_colors[s]
             for k in range(curves.shape[2]):
                 label = f'segment {used[s]}' if k == 0 else None
                 ax.plot(grid, curves[s,:,k], c=color, lw=1,

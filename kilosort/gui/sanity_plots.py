@@ -8,8 +8,20 @@ import torch
 from qtpy import QtCore, QtWidgets
 
 from kilosort.plots import (
-    COLOR_CODES, PROBE_PLOT_COLORS, segment_boundary_times
+    COLOR_CODES, PROBE_PLOT_COLORS, segment_boundary_times, _block_colors
     )
+
+
+def _qt_colors(rgba):
+    """Matplotlib RGBA colors (floats in [0, 1]) as 0-255 RGB tuples for
+    pyqtgraph pens."""
+    return [tuple(int(round(255*c)) for c in col[:3]) for col in rgba]
+
+
+def _block_qt_colors(ops, n_blocks):
+    """Same block colors and depth labels as the matplotlib drift plots."""
+    colors, labels = _block_colors(ops if ops is not None else {}, n_blocks)
+    return _qt_colors(colors), labels
 
 
 class PlotWindow(QtWidgets.QWidget):
@@ -53,9 +65,11 @@ def plot_drift_amount(plot_window, dshift, settings, ops=None):
     NT = settings['batch_size']
     t = np.arange(dshift.shape[0])*(NT/fs) + settings['tmin']
 
+    # Color blocks by depth, as in kilosort.plots.plot_drift_amount.
+    colors, labels = _block_qt_colors(ops, dshift.shape[1])
+    p1.addLegend(offset=(10, 10), labelTextSize='7pt')
     for i in range(dshift.shape[1]):
-        color = COLOR_CODES[i % len(COLOR_CODES)]
-        p1.plot(t, dshift[:,i], pen=color)
+        p1.plot(t, dshift[:,i], pen=colors[i], name=labels[i])
 
     if ops is not None:
         _add_segment_boundaries(p1, ops, settings)
@@ -90,11 +104,12 @@ def plot_chronic_drift(plot_window, ops, settings):
     n_seg = ops['drift_segment_used'].size
     title = 'Drift per segment' + (' with learned shape' if has_shape else '')
     p1.setTitle(f'{title} ({n_seg} segments, {dshift.shape[1]} blocks)')
+    colors, labels = _block_qt_colors(ops, dshift.shape[1])
+    p1.addLegend(offset=(10, 10), labelTextSize='7pt')
     for i in range(dshift.shape[1]):
-        color = COLOR_CODES[i % len(COLOR_CODES)]
         # dshift is already piecewise constant, so a plain line shows
         # the steps without depending on pyqtgraph's stepMode.
-        p1.plot(t, dshift[:,i], pen=color)
+        p1.plot(t, dshift[:,i], pen=colors[i], name=labels[i])
     _add_segment_boundaries(p1, ops, settings)
 
     if residual is not None:
@@ -106,9 +121,10 @@ def plot_chronic_drift(plot_window, ops, settings):
         p2.setTitle(f'Within-segment residual drift{after} '
                     f'(dashed band: +/- binning_depth = {dd} um)')
         tr = ops['drift_residual_batches']*(NT/fs) + settings['tmin']
+        res_colors, _ = _block_qt_colors(ops, residual.shape[1])
         for i in range(residual.shape[1]):
-            color = COLOR_CODES[i % len(COLOR_CODES)]
-            p2.plot(tr, residual[:,i], pen=color)
+            # Slightly transparent so later blocks don't hide earlier ones.
+            p2.plot(tr, residual[:,i], pen=(*res_colors[i], 204))
         band = pg.mkPen(color=(128, 128, 128), style=QtCore.Qt.DashLine)
         for y in [-dd, dd]:
             p2.addItem(pg.InfiniteLine(pos=y, angle=0, pen=band))
@@ -127,8 +143,12 @@ def plot_chronic_drift(plot_window, ops, settings):
         # shape.
         styles = [QtCore.Qt.SolidLine, QtCore.Qt.DashLine, QtCore.Qt.DotLine,
                   QtCore.Qt.DashDotLine]
+        # Segments are ordered in time: sequential colors, as in
+        # kilosort.plots.plot_chronic_drift.
+        seg_colors = _qt_colors(matplotlib.colormaps['viridis'](
+            np.linspace(0.2, 1, curves.shape[0])))
         for s in range(curves.shape[0]):
-            color = COLOR_CODES[s % len(COLOR_CODES)]
+            color = seg_colors[s]
             for k in range(curves.shape[2]):
                 pen = pg.mkPen(color=color, style=styles[k % len(styles)])
                 p3.plot(grid, curves[s,:,k], pen=pen)
